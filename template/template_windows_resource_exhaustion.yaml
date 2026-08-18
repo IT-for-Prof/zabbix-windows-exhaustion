@@ -1,0 +1,1088 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 1d9c5416b33343fa94a09c66b4ed9e22
+      name: Templates/Operating systems
+  templates:
+    - uuid: 66dc4a2b623142faad3d97af8561ff1c
+      template: Windows resource exhaustion by Zabbix agent
+      name: Windows resource exhaustion by Zabbix agent
+      description: |
+        Resource exhaustion and leaks on Windows - sockets, handles, kernel pool - attributed per process.
+
+        Answers "who on this machine is leaking and what is running out". Role-agnostic.
+        Stock agent keys only (wmi.getall, wmi.get, perf_counter_en, eventlog): no agent configuration
+        change, no UserParameter, no third-party collector.
+
+        Collected:
+        - TCP sockets by state from MSFT_NetTCPConnection, including Bound, which neither netstat
+          without -q nor net.tcp.socket.count reports;
+        - the top processes holding Bound and CLOSE_WAIT, ready for alert operational data;
+        - the dynamic port range as Windows actually has it, and the headroom left in it;
+        - handles: system total, busiest process, top processes as "name (PID)=count";
+        - kernel pool: nonpaged and paged;
+        - Windows events 4227 / 4231, the authoritative "ephemeral ports exhausted" signal.
+
+        Two WMI table probes every five minutes, both with history 0 - the raw JSON is never stored.
+
+        Deliberately not collected: net.tcp.socket.count (it does not see Bound and would give a second,
+        contradicting number), per-process discovery (hundreds of items for three figures), MaxUserPort
+        from the registry (ignored by Windows since Vista), and anything the stock Windows template
+        already provides.
+
+        Alerting principle: a leak is the absence of a return to baseline, not a large number. There is
+        no absolute threshold for how many handles or sockets a process may hold, because normal counts
+        differ between server roles by two orders of magnitude and any default is wrong on most of a
+        fleet. Each leak detector compares a host with itself: the floor of the last six hours against
+        the floor of the last twelve, that against the floor of the last day, and the last six hours
+        against the highest reading of the six before them. Thresholds survive only where the ceiling
+        is physical - kernel pool as a share of RAM, and headroom in the discovered port range.
+
+        Known limitation: Zabbix cannot join two master items, so socket alerts carry PIDs while process
+        names live in "Processes: PID to name map". Every socket trigger links straight to it.
+
+        Requirements:
+        - Windows 8 / Server 2012 or newer (root\StandardCimv2 with MSFT_NetTCPConnection).
+        - Zabbix agent or agent 2 with the default configuration. Verified on agent 2 7.0.18 /
+          Windows Server 2025 against Zabbix 7.0.
+        - perf_counter_en, not perf_counter: on a localized Windows the non-localized key finds nothing.
+        - The server or proxy must reach the agent for passive checks. The event log item is the one
+          exception: eventlog[] is an active-only key and stays silent where active checks are not set up.
+        - Link IN ADDITION to the stock Windows template, not instead of it.
+        - The leak detectors read item history, not trends. They need twelve hours of it to be fully
+          armed after linking, and report OK rather than Unknown before that. Shortening history below
+          12h on winex.handles.max, winex.sock.bound or the two pool counters disables them silently -
+          that is the one setting to leave alone. Trends are irrelevant to them.
+        - {$WINEX.WMI.TIMEOUT} defaults to 15s, which is comfortable on an ordinary server and tight on
+          a busy one: enumerating MSFT_NetTCPConnection on a host holding ~3900 TCP connections has been
+          seen to exceed it. Raise it there rather than lengthening the probe interval.
+        - The dynamic port range is discovered from MSFT_NetTCPSetting, not configured. Nothing needs
+          to be kept in step with "netsh int ipv4 set dynamicport tcp"; retuning the range replaces
+          the headroom item, so its history restarts and the forecast needs six hours again.
+        - {$WINEX.NODATA.PERIOD} must stay at least three times {$WINEX.PROBE.INTERVAL}.
+
+        Author:  Konstantin Tyutyunnik / Константин Тютюнник
+        Site:    https://itforprof.com
+        Repo:    https://github.com/IT-for-Prof/zabbix-windows-exhaustion
+        License: MIT (c) 2026 Konstantin Tyutyunnik
+      vendor:
+        name: itforprof.com
+        version: 1.0.0
+      groups:
+        - name: Templates/Operating systems
+      items:
+        - uuid: 865e40f31d4a4dbea7082f5a57214b24
+          name: 'Sockets: WMI probe'
+          key: 'wmi.getall[root\standardcimv2,"SELECT State,OwningProcess FROM MSFT_NetTCPConnection"]'
+          delay: '{$WINEX.PROBE.INTERVAL}'
+          timeout: '{$WINEX.WMI.TIMEOUT}'
+          history: '0'
+          trends: '0'
+          value_type: TEXT
+          description: |
+            Raw socket table, about 60 bytes per socket.
+            History is 0 on purpose: the history column truncates at 65535 bytes while preprocessing
+            receives the value in full, so storing it would only produce a misleading half-record.
+            WMI returns InstanceID whether or not it is selected, and the local port is parsed out of
+            it - which is why LocalPort is not in the SELECT.
+          tags:
+            - tag: component
+              value: network
+            - tag: scope
+              value: capacity
+        - uuid: bf79fa9a74ff4e5b9ad0139a7af6c530
+          name: 'Processes: WMI probe'
+          key: 'wmi.getall[root\cimv2,"SELECT Name,ProcessId,HandleCount FROM Win32_Process"]'
+          delay: '{$WINEX.PROBE.INTERVAL}'
+          timeout: '{$WINEX.WMI.TIMEOUT}'
+          history: '0'
+          trends: '0'
+          value_type: TEXT
+          description: 'Raw process table. Feeds the handle items and the PID-to-name map.'
+          tags:
+            - tag: component
+              value: os
+            - tag: scope
+              value: capacity
+        - uuid: 7e14c50bb6034fc6b6d2d85c63c5de5d
+          name: 'Sockets: state summary'
+          key: winex.sock.summary
+          type: DEPENDENT
+          history: '0'
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: 'wmi.getall[root\standardcimv2,"SELECT State,OwningProcess FROM MSFT_NetTCPConnection"]'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  if (value.slice(-1) !== ']') throw 'truncated WMI payload, ' + value.length + ' bytes';
+                  var a = JSON.parse(value);
+                  var acc = {bound: {}, cw: {}};
+                  var c = {total: a.length, listen: 0, established: 0, close_wait: 0, time_wait: 0, bound: 0};
+                  for (var i = 0; i < a.length; i++) {
+                    var st = Number(a[i].State), bucket = null;
+                    if (st === 2) c.listen++;
+                    else if (st === 5) c.established++;
+                    else if (st === 8) { c.close_wait++; bucket = 'cw'; }
+                    else if (st === 11) c.time_wait++;
+                    else if (st === 100) { c.bound++; bucket = 'bound'; }
+                    if (bucket) {
+                      var p = String(a[i].OwningProcess);
+                      acc[bucket][p] = (acc[bucket][p] || 0) + 1;
+                    }
+                  }
+                  function top(o) {
+                    var r = [];
+                    for (var k in o) r.push([k, o[k]]);
+                    r.sort(function (x, y) { return y[1] - x[1]; });
+                    var out = [];
+                    for (var i = 0; i < r.length && i < 5; i++) out.push('PID ' + r[i][0] + '=' + r[i][1]);
+                    return out.length ? out.join(', ') : 'none';
+                  }
+                  c.bound_max = 0;
+                  for (var k in acc.bound) if (acc.bound[k] > c.bound_max) c.bound_max = acc.bound[k];
+                  c.bound_top = top(acc.bound);
+                  c.cw_top = top(acc.cw);
+                  return JSON.stringify(c);
+          description: |
+            A single pass over the raw table feeds every socket item below: counts and per-process
+            top lists.
+            States are 2 Listen, 5 Established, 8 CloseWait, 11 TimeWait, 100 Bound. 100 is not listed
+            in the class reference; it is the Bound state, a local port held with no peer.
+            Port headroom is not computed here: it needs the dynamic range, which is discovered rather
+            than declared - see the discovery rule below.
+          tags:
+            - tag: component
+              value: network
+        - uuid: 153406683fb74e94a3be7694790c3061
+          name: 'Sockets: total'
+          key: winex.sock.total
+          type: DEPENDENT
+          value_type: UNSIGNED
+          master_item:
+            key: winex.sock.summary
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.total
+          description: 'Carries the liveness trigger for the whole socket chain: no value here means the agent is down, the WMI probe is unsupported, or the payload was truncated.'
+          tags:
+            - tag: component
+              value: network
+        - uuid: 2d4d185727424e3eb0925af32c314e3b
+          name: 'Sockets: established'
+          key: winex.sock.established
+          type: DEPENDENT
+          value_type: UNSIGNED
+          master_item:
+            key: winex.sock.summary
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.established
+          description: 'IPv4 and IPv6 together. A \TCPv4\Connections Established counter on its own can understate a dual-stack host severalfold, which is why the TCPv4 and TCPv6 counters are not collected here.'
+          tags:
+            - tag: component
+              value: network
+        - uuid: 6f0ebaf917294093a9bacc741904c08a
+          name: 'Sockets: CLOSE_WAIT'
+          key: winex.sock.close_wait
+          type: DEPENDENT
+          value_type: UNSIGNED
+          master_item:
+            key: winex.sock.summary
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.close_wait
+          tags:
+            - tag: component
+              value: network
+        - uuid: 3cae3d123bdd4d5b9560b9c4824155d7
+          name: 'Sockets: TIME_WAIT'
+          key: winex.sock.time_wait
+          type: DEPENDENT
+          value_type: UNSIGNED
+          master_item:
+            key: winex.sock.summary
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.time_wait
+          tags:
+            - tag: component
+              value: network
+        - uuid: 13630f1d76b34254b338234502ccdadc
+          name: 'Sockets: Bound'
+          key: winex.sock.bound
+          type: DEPENDENT
+          value_type: UNSIGNED
+          master_item:
+            key: winex.sock.summary
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.bound
+          description: 'Sockets holding a local port with no peer. Invisible to netstat without -q and to net.tcp.socket.count. This is the number that grows during ephemeral port exhaustion.'
+          tags:
+            - tag: component
+              value: network
+            - tag: scope
+              value: capacity
+        - uuid: 07650ec21c13495887f06491e78976be
+          name: 'Sockets: Bound on the busiest process'
+          key: winex.sock.bound.max
+          type: DEPENDENT
+          value_type: UNSIGNED
+          master_item:
+            key: winex.sock.summary
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.bound_max
+          description: 'Maximum, never sum or average: processes like httpd, svchost and application workers run in packs, and an average would smear a single leaking instance away.'
+          tags:
+            - tag: component
+              value: network
+            - tag: scope
+              value: capacity
+        - uuid: 8b02ab54b91a4e66a3b3756ab016fe16
+          name: 'Sockets: top processes holding Bound'
+          key: winex.sock.bound.top
+          type: DEPENDENT
+          value_type: TEXT
+          master_item:
+            key: winex.sock.summary
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.bound_top
+          description: 'Top five as "PID n=count", short enough for the 255-character operational data field. Resolve the PIDs in "Processes: PID to name map".'
+          tags:
+            - tag: component
+              value: network
+            - tag: scope
+              value: capacity
+        - uuid: 63e220ea507348b28c45a7ac6994261f
+          name: 'Sockets: top processes holding CLOSE_WAIT'
+          key: winex.sock.close_wait.top
+          type: DEPENDENT
+          value_type: TEXT
+          master_item:
+            key: winex.sock.summary
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.cw_top
+          description: 'CLOSE_WAIT means the local application never called close() on a socket the peer already closed. This names the process responsible.'
+          tags:
+            - tag: component
+              value: network
+        - uuid: 000174cbe5f0478e846442b30bb9460f
+          name: 'Ports: dynamic range probe'
+          key: 'wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]'
+          delay: '{$WINEX.PROBE.INTERVAL}'
+          timeout: '{$WINEX.WMI.TIMEOUT}'
+          history: 1d
+          trends: '0'
+          value_type: TEXT
+          description: |
+            The range as Windows actually has it. It is set with
+            "netsh int ipv4 set dynamicport tcp start=N num=M" and persisted in an undocumented binary
+            value under HKLM\SYSTEM\CurrentControlSet\Control\Nsi, which is why it is read over WMI
+            and not from the registry. MaxUserPort in Tcpip\Parameters has been ignored since Vista
+            and usually does not exist.
+          tags:
+            - tag: component
+              value: network
+            - tag: scope
+              value: capacity
+        - uuid: 79dd9eebb9ed4b8d9bfd5e0749b21356
+          name: 'Processes: handle summary'
+          key: winex.proc.handles
+          type: DEPENDENT
+          history: '0'
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: 'wmi.getall[root\cimv2,"SELECT Name,ProcessId,HandleCount FROM Win32_Process"]'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  if (value.slice(-1) !== ']') throw 'truncated WMI payload, ' + value.length + ' bytes';
+                  var a = JSON.parse(value), t = 0, r = [];
+                  for (var i = 0; i < a.length; i++) {
+                    var h = Number(a[i].HandleCount || 0);
+                    t += h;
+                    r.push([String(a[i].Name), Number(a[i].ProcessId), h]);
+                  }
+                  var byPid = r.slice();
+                  byPid.sort(function (x, y) { return x[1] - y[1]; });
+                  var map = [];
+                  for (var i = 0; i < byPid.length; i++) map.push(byPid[i][1] + '=' + byPid[i][0]);
+                  r.sort(function (x, y) { return y[2] - x[2]; });
+                  var out = [];
+                  for (var i = 0; i < r.length && i < 5; i++) out.push(r[i][0] + ' (PID ' + r[i][1] + ')=' + r[i][2]);
+                  return JSON.stringify({total: t, max: r.length ? r[0][2] : 0, top: out.join(', '), map: map.join('  ')});
+          description: 'A single pass over the process table feeds every handle item below, including the PID-to-name map. Unlike the socket side, Win32_Process carries the process name, so the top list is readable without a lookup.'
+          tags:
+            - tag: component
+              value: os
+            - tag: scope
+              value: capacity
+        - uuid: cb4270630b77434eb73a912f5bf795ac
+          name: 'Handles: total'
+          key: winex.handles.total
+          type: DEPENDENT
+          value_type: UNSIGNED
+          master_item:
+            key: winex.proc.handles
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.total
+          description: 'Carries the liveness trigger for the whole process chain.'
+          tags:
+            - tag: component
+              value: os
+            - tag: scope
+              value: capacity
+        - uuid: 96ff7ea363194823b12847b1d61a509a
+          name: 'Handles: busiest process'
+          key: winex.handles.max
+          type: DEPENDENT
+          value_type: UNSIGNED
+          master_item:
+            key: winex.proc.handles
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.max
+          tags:
+            - tag: component
+              value: os
+            - tag: scope
+              value: capacity
+        - uuid: feea6d138f34481897fe8c1719b7c0ce
+          name: 'Handles: top processes'
+          key: winex.handles.top
+          type: DEPENDENT
+          value_type: TEXT
+          master_item:
+            key: winex.proc.handles
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.top
+          description: 'Top five as "name (PID)=count". Goes straight into alert operational data.'
+          tags:
+            - tag: component
+              value: os
+            - tag: scope
+              value: capacity
+        - uuid: c03d145e49ad48259c12f10121a72ff1
+          name: 'Processes: PID to name map'
+          key: winex.proc.pidmap
+          type: DEPENDENT
+          history: 1d
+          value_type: TEXT
+          master_item:
+            key: winex.proc.handles
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.map
+          description: 'Sorted by PID so the PIDs in a socket alert can be looked up by eye. It exists because Zabbix cannot join two master items. Every socket trigger links here.'
+          tags:
+            - tag: component
+              value: os
+        - uuid: 5f2c1a94e0b64d3b9a71c8e2d4067b15
+          name: 'Handles: 12h growth of the floor'
+          key: winex.handles.growth
+          type: CALCULATED
+          history: 31d
+          params: 'last(//winex.handles.max)-min(//winex.handles.max,12h)'
+          delay: '{$WINEX.PROBE.INTERVAL}'
+          description: |
+            How many handles the busiest process has gained over the last twelve hours: the current
+            reading minus the lowest one in that window. The number an operator actually needs during
+            a leak, and the one a raw counter never shows - a count of 38392 handles says nothing
+            without knowing it was 24000 half a day ago.
+            It was briefly the difference between the 6-hour and the 12-hour floor, which on a
+            monotone climb measures the rise during the six hours *ending* six hours ago and so
+            reports about half the real gain. The alert said "up 6693 in 12h" while the process had
+            actually taken 14110 in that time. Same shape of arithmetic, wrong number in front
+            of a person deciding how urgent this is.
+            last() sits inside the window it is compared against, so the value can never be negative
+            and neither term can be empty while the other holds data - the item cannot go unsupported
+            on a freshly linked host. With a single sample both terms are that sample and the value
+            is 0, which is also what the leak trigger needs to stay quiet during warm-up.
+          tags:
+            - tag: component
+              value: os
+            - tag: scope
+              value: capacity
+        - uuid: 7723f063cc3d45a7b4e6b3ba81e31d89
+          name: 'Windows events: TCP port exhaustion'
+          key: 'eventlog[System,,,,^(4227|4231)$,,skip]'
+          type: ZABBIX_ACTIVE
+          delay: 1m
+          history: 7d
+          value_type: LOG
+          description: |
+            Events 4227 and 4231 are Windows stating outright that it could not allocate an ephemeral
+            port. This is confirmation of a failure already in progress, not an early warning: the port
+            headroom and forecast triggers fire while ports still remain. Its value is that it is the
+            only port signal independent of the macro-declared range, so it still fires when the
+            headroom arithmetic is wrong. The event text is system-wide and does not name a process.
+            A healthy host produces nothing here, so an empty item is the normal state and no nodata
+            trigger is attached to it.
+            eventlog[] is an ACTIVE-ONLY key. On a host that does not run active checks this item stays
+            empty for ever and is indistinguishable from a healthy one - confirm active checks are
+            configured before relying on this signal. Everything else in this template is passive.
+          tags:
+            - tag: component
+              value: network
+            - tag: scope
+              value: capacity
+        - uuid: 42f710a1775f4141a66cb30c2db9931f
+          name: 'Memory: physical total'
+          key: 'wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"]'
+          delay: '{$WINEX.PROBE.INTERVAL}'
+          timeout: '{$WINEX.WMI.TIMEOUT}'
+          value_type: FLOAT
+          units: B
+          description: |
+            Collected only as the denominator for the kernel pool ratios below. It is read over WMI
+            rather than reusing the stock template's vm.memory.size[total], because depending on
+            another template's item would make this one unlinkable without it.
+            Polled on the ordinary probe interval rather than hourly even though the value never
+            changes: on a newly linked host the ratios stay unsupported until it first arrives, and an
+            hourly first poll would trip the pool liveness trigger before the denominator ever showed up.
+          tags:
+            - tag: component
+              value: memory
+        - uuid: b68b5130bd2845b1bbb06b154ddb3555
+          name: 'Kernel pool: nonpaged, share of RAM'
+          key: winex.pool.nonpaged.pct
+          type: CALCULATED
+          history: 1h
+          params: '100*avg(//perf_counter_en["\Memory\Pool Nonpaged Bytes",60],5m)/last(//wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"])'
+          delay: 1m
+          trends: '0'
+          value_type: FLOAT
+          units: '%'
+          description: |
+            The nonpaged pool measured against the memory it has to fit in, which is what actually
+            bounds it on x64. An absolute ceiling is wrong in both directions at once: it is tight on
+            a large host that legitimately runs a large pool, and so loose on a very large host that
+            a genuine runaway never reaches it.
+            The numerator is a 5-minute average rather than the last value on purpose: last() returns
+            the most recent stored reading no matter how old, so a counter that stops updating would be
+            republished as a fresh-looking ratio for ever and nothing would notice. avg() over a window
+            fails when the window is empty, which turns a stalled counter into an unsupported item that
+            the pool liveness trigger can see.
+            The denominator stays last(): physical memory genuinely does not change between readings.
+            A memory reading that stops arriving is caught by its own clause in that liveness trigger.
+            Trends are off because only min() and nodata() read this item; the raw byte counters keep
+            theirs. Turn trends back on before adding any trendmin() or timeleft() trigger here.
+          tags:
+            - tag: component
+              value: memory
+            - tag: scope
+              value: capacity
+        - uuid: 99acf6617f2e43fcb755e66bc889a377
+          name: 'Kernel pool: paged, share of RAM'
+          key: winex.pool.paged.pct
+          type: CALCULATED
+          history: 1h
+          params: '100*avg(//perf_counter_en["\Memory\Pool Paged Bytes",60],5m)/last(//wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"])'
+          delay: 1m
+          trends: '0'
+          value_type: FLOAT
+          units: '%'
+          description: |
+            Paged pool against the memory it shares. Same construction and the same reasons as the
+            nonpaged ratio: a windowed numerator so a stalled counter becomes visible rather than
+            frozen, last() for the denominator because memory does not change, unsupported when either
+            input is missing, and no trends because nothing reads them.
+            Paged pool varies far more between server roles than nonpaged does, so its ceiling is
+            correspondingly looser - but it is still a ceiling, not a licence.
+          tags:
+            - tag: component
+              value: memory
+            - tag: scope
+              value: capacity
+        - uuid: 2c7d8d456e014aceb4ec45375af616c9
+          name: 'Kernel pool: nonpaged'
+          key: 'perf_counter_en["\Memory\Pool Nonpaged Bytes",60]'
+          delay: 1m
+          units: B
+          description: |
+            The averaging parameter 60 is mandatory: without it this key is identical to the one in the
+            stock Windows template and linking both templates to one host fails.
+          tags:
+            - tag: component
+              value: memory
+            - tag: scope
+              value: capacity
+        - uuid: d82f7c3e89d54704a9fea2808d0e1e6b
+          name: 'Kernel pool: paged'
+          key: 'perf_counter_en["\Memory\Pool Paged Bytes",60]'
+          delay: 1m
+          units: B
+          description: 'The averaging parameter 60 is carried for symmetry with the nonpaged counter, where it is mandatory to avoid a key collision with the stock Windows template.'
+          tags:
+            - tag: component
+              value: memory
+            - tag: scope
+              value: capacity
+      discovery_rules:
+        - uuid: bf4f278194254ad7aa248a74cf018f27
+          name: 'Dynamic port range discovery'
+          key: winex.ports.range.discovery
+          type: DEPENDENT
+          lifetime: 7d
+          master_item:
+            key: 'wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]'
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var a = JSON.parse(value);
+                  if (!a.length) throw 'MSFT_NetTCPSetting returned no Internet setting';
+                  var start = Number(a[0].DynamicPortRangeStartPort);
+                  var num = Number(a[0].DynamicPortRangeNumberOfPorts);
+                  if (!(start > 0 && start < 65536 && num > 0 && start % 1 === 0 && num % 1 === 0
+                        && start + num <= 65536)) {
+                    throw 'implausible dynamic port range: start=' + start + ' num=' + num;
+                  }
+                  return JSON.stringify([{start: start, num: num}]);
+          lld_macro_paths:
+            - lld_macro: '{#PORT_NUM}'
+              path: $.num
+            - lld_macro: '{#PORT_START}'
+              path: $.start
+          description: |
+            The dynamic port range is measured, not declared. Windows reports it through
+            MSFT_NetTCPSetting, and discovery carries the two numbers into the headroom item and its
+            triggers - so there is no macro to keep in sync and nothing that can silently diverge
+            after someone runs "netsh int ipv4 set dynamicport tcp start=N num=M".
+            Zabbix requires a prototype key to contain a discovery macro, so the headroom item is
+            keyed by the range. Retuning the range therefore replaces the item instead of updating it
+            and its history restarts: the absolute trigger recovers within its own window, the
+            forecast needs six hours again, and the superseded item is disabled rather than deleted.
+            A row that fails the sanity check raises an error rather than discovering nothing. The
+            difference matters: an unsupported rule leaves whatever was already discovered in place,
+            whereas an empty discovery would let a host that reports nonsense delete its own
+            port-exhaustion monitoring without a word.
+          item_prototypes:
+            - uuid: 57b80e59e6d946d688a0d7693bc4715e
+              name: 'Ports: free in the dynamic range'
+              key: 'winex.ports.eph.free[{#PORT_START},{#PORT_NUM}]'
+              type: DEPENDENT
+              value_type: UNSIGNED
+              master_item:
+                key: 'wmi.getall[root\standardcimv2,"SELECT State,OwningProcess FROM MSFT_NetTCPConnection"]'
+              preprocessing:
+                - type: JAVASCRIPT
+                  parameters:
+                    - |
+                      if (value.slice(-1) !== ']') throw 'truncated WMI payload, ' + value.length + ' bytes';
+                      var a = JSON.parse(value), lo = {#PORT_START}, num = {#PORT_NUM}, hi = lo + num - 1;
+                      var used = {};
+                      for (var i = 0; i < a.length; i++) {
+                        var lp = Number(String(a[i].InstanceID || '').split('++')[1]);
+                        if (lp >= lo && lp <= hi) used[lp] = 1;
+                      }
+                      return num - Object.keys(used).length;
+              description: |
+                Headroom inside the range Windows actually has. Reaching zero means outbound
+                connections start failing on an otherwise healthy server.
+                Distinct local ports are counted with IPv4 and IPv6 collapsed into one set: a port
+                consumed on both families counts once, so this is an upper bound on headroom. It is
+                also TCP-only - UDP consumption and port reservations are invisible - so leave margin
+                in {$WINEX.PORTS.FREE.PCT} rather than trusting the last port.
+                This parses the raw socket table a second time instead of reading the shared summary,
+                because the range filter has to run while the rows are still individually visible.
+              tags:
+                - tag: component
+                  value: network
+                - tag: scope
+                  value: capacity
+          trigger_prototypes:
+            - uuid: 9e79a5dfca644a16908b949aead20f6e
+              expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.time_wait,{$WINEX.NODATA.PERIOD})=0 and nodata(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.sock.time_wait,10m)>{#PORT_NUM}*{$WINEX.SOCK.TIMEWAIT.PCT}/100 and last(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}])>=0'
+              name: 'Reconnect storm'
+              event_name: '{ITEM.LASTVALUE1} sockets in TIME_WAIT on {HOST.NAME}, {$WINEX.SOCK.TIMEWAIT.PCT}% of its {#PORT_NUM}-port range'
+              priority: WARNING
+              description: |
+                Churn rather than a leak: TIME_WAIT drains on its own within a couple of minutes. It matters
+                because it holds ports out of the same range everything else needs, which is why this trigger
+                lives in the port-range discovery rule rather than beside the other socket triggers - it is the
+                one socket signal whose meaning depends on how wide that range is, and the range is discovered
+                per host rather than assumed.
+                The trailing >=0 on the headroom item ties the trigger to the liveness of the measurement its
+                threshold is derived from, so a stale {#PORT_NUM} cannot keep it looking meaningful after the
+                range stopped being read.
+                There is no per-process breakdown because a TIME_WAIT socket is already detached from its
+                process and Windows reports OwningProcess 0 for all of them.
+              dependencies:
+                - name: 'Port range probe: no data'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1'
+                - name: 'Socket probe: no data'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.total,{$WINEX.NODATA.PERIOD})=1'
+              tags:
+                - tag: component
+                  value: network
+                - tag: scope
+                  value: capacity
+            - uuid: a6ae81f9181b48a294c5cb0c679f1681
+              expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and max(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],15m)<{#PORT_NUM}*{$WINEX.PORTS.FREE.PCT}/100 and length(last(/Windows resource exhaustion by Zabbix agent/winex.sock.bound.top))>0'
+              name: 'Dynamic port range is running out'
+              event_name: 'Only {ITEM.LASTVALUE1} of {#PORT_NUM} dynamic ports left on {HOST.NAME}'
+              opdata: 'holding Bound: {{ITEM.LASTVALUE3}.regsub("(.*)", \1)}'
+              priority: HIGH
+              description: 'The threshold is a share of the measured range rather than a fixed count, because widening the range changes what any fixed number means. Widening with netsh buys time and survives a reboot, but it postpones the failure rather than fixing it - the process to look at is in the operational data.'
+              dependencies:
+                - name: 'Port range probe: no data'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1'
+                - name: 'Socket probe: no data'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.total,{$WINEX.NODATA.PERIOD})=1'
+              url_name: 'PID to name map'
+              url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
+              tags:
+                - tag: pidmap_item
+                  value: winex.proc.pidmap
+                - tag: component
+                  value: network
+                - tag: scope
+                  value: capacity
+            - uuid: 7565bd6f93354ef5808c73032cbfc289
+              expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,{$WINEX.NODATA.PERIOD})=0 and nodata(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,1h)>{$WINEX.SOCK.BOUND.FLOOR} and timeleft(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],6h,0)<{$WINEX.PORTS.TIMELEFT}'
+              name: 'Dynamic port range will run out'
+              event_name: 'Dynamic ports on {HOST.NAME} run out in under {$WINEX.PORTS.TIMELEFT} at the current rate'
+              opdata: 'Bound now {ITEM.LASTVALUE1}, free {ITEM.LASTVALUE2}'
+              priority: WARNING
+              description: |
+                Linear forecast over the last six hours of headroom - the standard way to turn a
+                consumption curve into lead time.
+                A forecast on its own is noisy on flat data, so it is gated on Bound sockets having
+                already accumulated past {$WINEX.SOCK.BOUND.FLOOR}. On a host that is not
+                accumulating, timeleft() returns effectively infinity and this stays quiet.
+              dependencies:
+                - name: 'Port range probe: no data'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1'
+                - name: 'Dynamic port range is running out'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and max(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],15m)<{#PORT_NUM}*{$WINEX.PORTS.FREE.PCT}/100 and length(last(/Windows resource exhaustion by Zabbix agent/winex.sock.bound.top))>0'
+              url_name: 'PID to name map'
+              url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
+              tags:
+                - tag: pidmap_item
+                  value: winex.proc.pidmap
+                - tag: component
+                  value: network
+                - tag: scope
+                  value: capacity
+          graph_prototypes:
+            - uuid: 184c80fe459544c98b6a5e8a2cf2a8a5
+              name: 'Windows exhaustion: dynamic port headroom'
+              graph_items:
+                - sortorder: '0'
+                  color: 1A7C11
+                  item:
+                    host: Windows resource exhaustion by Zabbix agent
+                    key: 'winex.ports.eph.free[{#PORT_START},{#PORT_NUM}]'
+                - sortorder: '1'
+                  color: F63100
+                  item:
+                    host: Windows resource exhaustion by Zabbix agent
+                    key: winex.sock.bound.max
+      tags:
+        - tag: class
+          value: os
+        - tag: target
+          value: windows
+        - tag: vendor
+          value: microsoft
+      macros:
+        - macro: '{$WINEX.GROWTH.FACTOR}'
+          value: '1.05'
+          description: 'How far a floor must rise to count as a leak, applied twice: the 6-hour floor against the 12-hour, and the 12-hour against the day. It is deliberately small - specificity comes from the three clauses agreeing, not from a large ratio, and a large ratio is what makes a slow leak on a big baseline invisible. Raise it only if a genuinely growing workload is being reported.'
+        - macro: '{$WINEX.NODATA.PERIOD}'
+          value: 15m
+          description: 'Silence tolerated on a probe before it is reported. Keep it at least three times {$WINEX.PROBE.INTERVAL}.'
+        - macro: '{$WINEX.POOL.NONPAGED.PCT}'
+          value: '20'
+          description: 'Nonpaged pool ceiling, as a percent of physical memory. Measured reference: a healthy fleet sat between 0.2 and 6.4 percent, so this leaves about three times headroom over the busiest healthy host.'
+        - macro: '{$WINEX.POOL.PAGED.PCT}'
+          value: '15'
+          description: 'Paged pool ceiling, as a percent of physical memory. Paged pool varies more between roles than nonpaged does, so this is looser than the nonpaged ceiling - but it is set below the worst real anomaly measured on a mixed fleet (30 percent of RAM against a 3.5 percent median), because a ceiling above the thing it exists to catch catches nothing.'
+        - macro: '{$WINEX.PORTS.FREE.PCT}'
+          value: '12'
+          description: 'Minimum acceptable headroom in the dynamic range, as a percent of its measured size. A share rather than a count, because a widened range makes any fixed count mean something different.'
+        - macro: '{$WINEX.PORTS.TIMELEFT}'
+          value: 1d
+          description: 'How far ahead the port exhaustion forecast looks. Raise it for more warning, lower it for fewer forecasts.'
+        - macro: '{$WINEX.PROBE.INTERVAL}'
+          value: 5m
+          description: 'Polling interval of both WMI table probes.'
+        - macro: '{$WINEX.SOCK.BOUND.FLOOR}'
+          value: '500'
+          description: 'Bound sockets a host must already hold before the port-exhaustion forecast is allowed to speak, so that a host consuming no ports never produces a forecast. It gates only the forecast: the leak detectors carry no floor at all, because the three growth clauses already ignore a process going from four handles to seven, and a floor that silences a whole host is a threshold wearing another name.'
+        - macro: '{$WINEX.SOCK.CLOSEWAIT.MAX}'
+          value: '200'
+          description: 'CLOSE_WAIT sockets host-wide.'
+        - macro: '{$WINEX.SOCK.TIMEWAIT.PCT}'
+          value: '25'
+          description: 'TIME_WAIT sockets as a percent of the discovered dynamic port range, which is what they compete for. A share rather than a count, because the range width differs between hosts and a fixed count therefore means something different on each.'
+        - macro: '{$WINEX.WMI.TIMEOUT}'
+          value: 15s
+          description: 'Timeout of the WMI probes. Raise it before raising the polling interval.'
+  triggers:
+    - uuid: ce84ff442dff481eadf155ef88310bcb
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.total,{$WINEX.NODATA.PERIOD})=1'
+      name: 'Socket probe: no data'
+      event_name: 'Socket probe on {HOST.NAME} has been silent for {$WINEX.NODATA.PERIOD}'
+      opdata: 'last seen: {ITEM.LASTVALUE1} sockets'
+      priority: AVERAGE
+      description: |
+        Root of the socket chain. Each collection chain - sockets, processes, kernel pool, and the
+        event log - has its own root on purpose: a dependency here means "the parent's failure makes
+        this signal meaningless", not "these tend to fail together". Chaining them would let a stalled
+        WMI query silence a pool alert whose data is still arriving.
+        It sits on a dependent item rather than on the master, which makes one trigger cover all three
+        ways the chain can go quiet: the agent is down, the WMI probe went unsupported after a timeout
+        (an item error, which nodata on the master would not see), or the payload was rejected as
+        truncated by preprocessing.
+        It deliberately does not depend on the stock template's "Zabbix agent is not available":
+        a cross-template dependency would make this template unlinkable without that exact stock
+        template, and the passive and active variants are not interchangeable. Add that dependency
+        per host if you want it.
+      tags:
+        - tag: component
+          value: network
+        - tag: scope
+          value: availability
+    - uuid: d6ee90082baa4011baa0f57624b46713
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.handles.total,{$WINEX.NODATA.PERIOD})=1'
+      name: 'Process probe: no data'
+      event_name: 'Process probe on {HOST.NAME} has been silent for {$WINEX.NODATA.PERIOD}'
+      opdata: 'last seen: {ITEM.LASTVALUE1} handles'
+      priority: AVERAGE
+      description: 'Root of the process chain. It has no parent on purpose: the cimv2 probe fails independently of the socket probe, and chaining them would let a stalled socket query silence a live handle leak.'
+      tags:
+        - tag: component
+          value: os
+        - tag: scope
+          value: availability
+    - uuid: ae13b0bc20df4b459613f94a41566ca2
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=1'
+      name: 'Kernel pool: no data'
+      event_name: 'Kernel pool counters on {HOST.NAME} have been silent for {$WINEX.NODATA.PERIOD}'
+      opdata: 'last seen: nonpaged {ITEM.LASTVALUE1}, paged {ITEM.LASTVALUE2}'
+      priority: AVERAGE
+      description: 'Root of the kernel-pool chain, watching the raw counters themselves. It deliberately does NOT watch the derived ratio items: those are also fed by the memory reading, and a chain must be watched at its own source or a failure somewhere else silences it. No parent, because the pool rides perf_counter_en rather than WMI - a WMI stall must not silence alerts whose data is still arriving.'
+      tags:
+        - tag: component
+          value: memory
+        - tag: scope
+          value: availability
+    - uuid: 83257a589f9843d088f75fa5150bfabf
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"],{$WINEX.NODATA.PERIOD})=1'
+      name: 'Kernel pool ratio: no data'
+      event_name: 'Kernel pool ratios on {HOST.NAME} cannot be computed'
+      opdata: 'last seen: nonpaged {ITEM.LASTVALUE1} of RAM, paged {ITEM.LASTVALUE2} of RAM'
+      priority: AVERAGE
+      description: |
+        The percentage ceilings need both a counter and a memory reading. This watches the derived
+        items and the denominator, so a memory query that stops arriving is reported instead of
+        quietly leaving the ceilings unevaluated.
+        It is subordinate to the counter root: when the counters themselves die both would otherwise
+        fire, and the counter failure is the one worth reading.
+      dependencies:
+        - name: 'Kernel pool: no data'
+          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=1'
+      tags:
+        - tag: component
+          value: memory
+        - tag: scope
+          value: availability
+    - uuid: 67e59281c9d84fca9138afdc78ad4f9b
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1'
+      name: 'Port range probe: no data'
+      event_name: 'Dynamic port range on {HOST.NAME} has not been measured for {$WINEX.NODATA.PERIOD}'
+      opdata: 'last seen: {ITEM.LASTVALUE1}'
+      priority: AVERAGE
+      description: |
+        Root of the port-range chain. Without it this is the one collection path with no liveness
+        cover: the headroom item hangs off the socket probe, so a failure confined to this query
+        leaves the discovered range frozen at whatever it last was, and a range retuned with netsh
+        would never be picked up.
+        No parent, for the same reason the other roots have none - it is a separate query and fails
+        independently.
+      tags:
+        - tag: component
+          value: network
+        - tag: scope
+          value: availability
+    - uuid: 1c0ea932ec8442f6aac7638ee1d34c2f
+      expression: 'count(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^(4227|4231)$,,skip],30m)>0'
+      recovery_mode: RECOVERY_EXPRESSION
+      recovery_expression: 'nodata(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^(4227|4231)$,,skip],1h)=1'
+      name: 'Windows confirms TCP port exhaustion'
+      event_name: 'Windows on {HOST.NAME} logged a port-exhaustion event: {{ITEM.LASTVALUE1}.regsub("(.*)", \1)}'
+      priority: HIGH
+      description: |
+        Events 4227 / 4231 - Windows has already failed to hand out a port. Confirmation, not early
+        warning: the headroom and forecast triggers fire earlier, and this one does not name a process.
+        It earns its place by being the only port signal that does not depend on the macro-declared
+        range being correct.
+        No parent trigger: it rides the active-check transport, which fails independently of the
+        passive WMI probes. Recovery is time-based because count() alone would latch this trigger in
+        PROBLEM for ever - an event-log item produces values only during an incident.
+      url_name: 'PID to name map'
+      url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
+      tags:
+        - tag: pidmap_item
+          value: winex.proc.pidmap
+        - tag: component
+          value: network
+        - tag: scope
+          value: capacity
+    - uuid: db05ba62563e4c1ead60d703ed7bf5cb
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,6h)>min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,12h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,12h)>min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,24h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,6h)>max(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,6h:now-6h) and length(last(/Windows resource exhaustion by Zabbix agent/winex.sock.bound.top))>0'
+      name: 'Bound sockets are not returning to baseline'
+      recovery_mode: RECOVERY_EXPRESSION
+      recovery_expression: 'max(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,24h)>last(/Windows resource exhaustion by Zabbix agent/winex.sock.bound)*{$WINEX.GROWTH.FACTOR}'
+      event_name: 'Bound sockets on {HOST.NAME} are not returning to baseline ({ITEM.LASTVALUE1} now)'
+      opdata: 'Bound now {ITEM.LASTVALUE1}; top: {{ITEM.LASTVALUE8}.regsub("(.*)", \1)}'
+      priority: WARNING
+      manual_close: 'YES'
+      description: |
+        The socket half of the rule described on the handle trigger, and the only socket leak detector
+        here: the real ceiling for sockets is the dynamic port range, which has its own relative
+        triggers. The clause requiring the 6-hour floor to clear the preceding six hours outright is
+        what keeps this quiet on the common Windows pattern of a connection pool that fills and
+        recycles on a fixed period.
+      dependencies:
+        - name: 'Socket probe: no data'
+          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.total,{$WINEX.NODATA.PERIOD})=1'
+      url_name: 'PID to name map'
+      url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
+      tags:
+        - tag: pidmap_item
+          value: winex.proc.pidmap
+        - tag: component
+          value: network
+        - tag: scope
+          value: capacity
+    - uuid: 361ed86a3ddd49ae907871108c4fcc62
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.close_wait,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.sock.close_wait,15m)>{$WINEX.SOCK.CLOSEWAIT.MAX} and length(last(/Windows resource exhaustion by Zabbix agent/winex.sock.close_wait.top))>0'
+      name: 'Connections are not being closed'
+      event_name: '{ITEM.LASTVALUE1} sockets stuck in CLOSE_WAIT on {HOST.NAME}'
+      opdata: 'top: {{ITEM.LASTVALUE3}.regsub("(.*)", \1)}'
+      priority: WARNING
+      description: 'CLOSE_WAIT piles up when the local application never calls close() on a socket the peer already closed. An application bug rather than a network one; the operational data names the PID.'
+      dependencies:
+        - name: 'Socket probe: no data'
+          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.total,{$WINEX.NODATA.PERIOD})=1'
+      url_name: 'PID to name map'
+      url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
+      tags:
+        - tag: pidmap_item
+          value: winex.proc.pidmap
+        - tag: component
+          value: network
+        - tag: scope
+          value: capacity
+    - uuid: ce13acac58d84d6e886ebfccfae77e28
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.handles.max,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,6h)>min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,12h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,12h)>min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,24h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,6h)>max(/Windows resource exhaustion by Zabbix agent/winex.handles.max,6h:now-6h) and length(last(/Windows resource exhaustion by Zabbix agent/winex.handles.top))>0 and last(/Windows resource exhaustion by Zabbix agent/winex.handles.growth)>0'
+      name: 'Handles are not returning to baseline'
+      recovery_mode: RECOVERY_EXPRESSION
+      recovery_expression: 'max(/Windows resource exhaustion by Zabbix agent/winex.handles.max,24h)>last(/Windows resource exhaustion by Zabbix agent/winex.handles.max)*{$WINEX.GROWTH.FACTOR}'
+      event_name: '{{ITEM.LASTVALUE8}.regsub("^([^=,]+)", \1)} on {HOST.NAME} keeps taking handles: floor up {ITEM.LASTVALUE9} in 12h'
+      opdata: 'busiest now {ITEM.LASTVALUE1}, floor +{ITEM.LASTVALUE9} in 12h; top: {{ITEM.LASTVALUE8}.regsub("(.*)", \1)}'
+      priority: HIGH
+      manual_close: 'YES'
+      description: |
+        A leak is the absence of a return to baseline, not a large number, so this compares the
+        process's own recent floors instead of testing a threshold. Three clauses, each rejecting a
+        different shape that is not a leak:
+        - the 6-hour floor must clear the 12-hour floor: something is climbing now;
+        - the 12-hour floor must clear the day's floor: the climb survives a full daily cycle. Without
+          this an ordinary business-hours server alerts every afternoon, when its last six hours are
+          the working ramp and the six before them are the night trough;
+        - the 6-hour window must sit entirely above the highest reading of the preceding six hours,
+          which rejects a plateau after a restart and a pool that recycles on a fixed period.
+        There is no floor macro and no absolute number: a floor low enough to be harmless changes no
+        verdict, and one high enough to matter stops evaluation before the growth clauses run, which
+        is a threshold under another name.
+        Clause order is load-bearing. Zabbix stops evaluating an "and" chain at the first false term,
+        and the two nested-window comparisons lead because the shorter window is always a subset of the
+        longer, so they cannot fail on missing data. Only once they hold does evaluation reach the
+        shifted max() window or the calculated growth item, either of which can be empty on a young
+        host. From the first stored value onward the trigger is OK or PROBLEM, never Unknown.
+        Full sensitivity arrives 24 hours after linking; a steep climb is reported sooner. It closes
+        only when the value has actually fallen away from its 24-hour peak - growth merely stopping is
+        not recovery, because a leak that saturates against a ceiling stops growing too. manual_close
+        is on for a leak that is known and accepted.
+      dependencies:
+        - name: 'Process probe: no data'
+          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.handles.total,{$WINEX.NODATA.PERIOD})=1'
+      tags:
+        - tag: component
+          value: os
+        - tag: scope
+          value: capacity
+    - uuid: 8b30fefdb48241e5a3f71075bcfa8c7b
+      expression: 'min(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct,10m)>{$WINEX.POOL.NONPAGED.PCT} and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])>=0'
+      name: 'Nonpaged pool above the ceiling'
+      event_name: 'Nonpaged pool on {HOST.NAME} is {ITEM.LASTVALUE1} of RAM'
+      opdata: 'nonpaged pool now: {ITEM.LASTVALUE2}'
+      priority: HIGH
+      description: |
+        The ceiling is a share of physical memory rather than a fixed number of bytes, because on x64
+        it is memory that bounds the nonpaged pool. A fixed ceiling is wrong in both directions at
+        once: tight on a large host that legitimately runs a large pool, and so loose on a very large
+        one that a genuine runaway never reaches it.
+        Nonpaged pool exhaustion takes the whole machine down rather than one process.
+      dependencies:
+        - name: 'Kernel pool ratio: no data'
+          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"],{$WINEX.NODATA.PERIOD})=1'
+      tags:
+        - tag: bytes_item
+          value: 'perf_counter_en["\Memory\Pool Nonpaged Bytes",60]'
+        - tag: component
+          value: memory
+        - tag: scope
+          value: capacity
+    - uuid: a21cff1b44424aab8fab8fe8ecb15ca1
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],6h)>min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],12h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],12h)>min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],24h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],6h)>max(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],6h:now-6h)'
+      name: 'Nonpaged pool is not returning to baseline'
+      recovery_mode: RECOVERY_EXPRESSION
+      recovery_expression: 'max(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],24h)>last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])*{$WINEX.GROWTH.FACTOR}'
+      event_name: 'Nonpaged pool on {HOST.NAME} keeps growing: its 6h floor is {$WINEX.GROWTH.FACTOR}x its 12h floor'
+      opdata: 'nonpaged pool now: {ITEM.LASTVALUE1}'
+      priority: WARNING
+      manual_close: 'YES'
+      description: |
+        The nonpaged half of the pool detector - the rule described on the handle trigger. Nonpaged
+        pool is the scarcer of the two and the one a driver leak consumes, so a floor that climbs and
+        does not return is worth knowing about well before the ceiling trigger fires.
+      dependencies:
+        - name: 'Kernel pool: no data'
+          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=1'
+      tags:
+        - tag: component
+          value: memory
+        - tag: scope
+          value: capacity
+    - uuid: 6b5869e9585f49a18ac50c4531299b4b
+      expression: 'min(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct,10m)>{$WINEX.POOL.PAGED.PCT} and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60])>=0'
+      name: 'Paged pool above the ceiling'
+      event_name: 'Paged pool on {HOST.NAME} is {ITEM.LASTVALUE1} of RAM'
+      opdata: 'paged pool now: {ITEM.LASTVALUE2}'
+      priority: HIGH
+      description: 'Paged pool exhaustion shows up as failures to create handles, registry keys and desktop heaps rather than as a hang. Expressed as a share of memory for the same reason as the nonpaged ceiling; paged pool varies far more between roles, so the default is correspondingly looser.'
+      dependencies:
+        - name: 'Kernel pool ratio: no data'
+          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"],{$WINEX.NODATA.PERIOD})=1'
+      tags:
+        - tag: bytes_item
+          value: 'perf_counter_en["\Memory\Pool Paged Bytes",60]'
+        - tag: component
+          value: memory
+        - tag: scope
+          value: capacity
+    - uuid: 193e2e85c2a54989903c62f6fc319438
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],6h)>min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],12h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],12h)>min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],24h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],6h)>max(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],6h:now-6h)'
+      name: 'Paged pool is not returning to baseline'
+      recovery_mode: RECOVERY_EXPRESSION
+      recovery_expression: 'max(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],24h)>last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60])*{$WINEX.GROWTH.FACTOR}'
+      event_name: 'Paged pool on {HOST.NAME} keeps growing: its 6h floor is {$WINEX.GROWTH.FACTOR}x its 12h floor'
+      opdata: 'paged pool now: {ITEM.LASTVALUE1}'
+      priority: WARNING
+      manual_close: 'YES'
+      description: |
+        Pool leaks are slow, so this compares floors rather than peaks - the rule described on the
+        handle trigger. Paged pool also has an absolute ceiling as a share of RAM; this is the early
+        signal that fires while the ceiling still has headroom.
+        A workload step is not a leak: a terminal server filling up in the morning raises its 6-hour
+        floor every day, which is why the clause comparing the 12-hour floor with the day's is what
+        decides here.
+      dependencies:
+        - name: 'Kernel pool: no data'
+          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=1'
+      tags:
+        - tag: component
+          value: memory
+        - tag: scope
+          value: capacity
+  graphs:
+    - uuid: da72b531ed044cbbaa4fb7892a629f84
+      name: 'Windows exhaustion: sockets by state'
+      graph_items:
+        - sortorder: '0'
+          color: 1A7C11
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: winex.sock.bound
+        - sortorder: '1'
+          color: 2774A4
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: winex.sock.established
+        - sortorder: '2'
+          color: F63100
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: winex.sock.close_wait
+        - sortorder: '3'
+          color: A54F10
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: winex.sock.time_wait
+        - sortorder: '4'
+          color: 6C59DC
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: winex.sock.total
+        - sortorder: '5'
+          color: BB2222
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: winex.sock.bound.max
+    - uuid: f7ab0bcab95246ba83ae655fc8f3392b
+      name: 'Windows exhaustion: handles and kernel pool'
+      graph_items:
+        - sortorder: '0'
+          color: 1A7C11
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: winex.handles.total
+        - sortorder: '1'
+          color: 2774A4
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: winex.handles.max
+        - sortorder: '4'
+          color: BB2222
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: winex.handles.growth
+        - sortorder: '2'
+          color: F63100
+          yaxisside: RIGHT
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: 'perf_counter_en["\Memory\Pool Nonpaged Bytes",60]'
+        - sortorder: '3'
+          color: A54F10
+          yaxisside: RIGHT
+          item:
+            host: Windows resource exhaustion by Zabbix agent
+            key: 'perf_counter_en["\Memory\Pool Paged Bytes",60]'

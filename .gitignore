@@ -1,0 +1,23 @@
+# Deny by default, allow by exception.
+#
+# Everything is ignored unless re-included below, so a new file is invisible to
+# git until someone adds it here deliberately. Nothing rides along into a
+# published repository by accident - no editor backups, no caches, no scratch
+# files, no local notes, no captured data.
+#
+# Re-including a directory is not enough on its own: git descends into an
+# allowed directory, so each one needs its own "exclude everything, then allow
+# the file type" pair. Adding a new kind of file means editing this file, which
+# is the point.
+
+# --- repository root: nothing but these
+/*
+!/.gitignore
+!/LICENSE
+!/README.md
+!/README_EN.md
+!/template/
+
+# --- the template itself: the export only
+/template/*
+!/template/*.yaml
