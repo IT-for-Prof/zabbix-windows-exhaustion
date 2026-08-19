@@ -815,7 +815,7 @@ zabbix_export:
       expression: 'nodata(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1'
       name: 'Port range probe: no data'
       event_name: 'Dynamic port range on {HOST.NAME} has not been measured for {$WINEX.NODATA.PERIOD}'
-      opdata: 'last seen: {ITEM.LASTVALUE1}'
+      opdata: 'range last seen: {{ITEM.LASTVALUE1}.regsub("StartPort[^0-9]+([0-9]+)", \1)} + {{ITEM.LASTVALUE1}.regsub("NumberOfPorts[^0-9]+([0-9]+)", \1)} ports'
       priority: AVERAGE
       description: |
         Root of the port-range chain. Without it this is the one collection path with no liveness
@@ -904,10 +904,12 @@ zabbix_export:
       name: 'Handles are not returning to baseline'
       recovery_mode: RECOVERY_EXPRESSION
       recovery_expression: 'max(/Windows resource exhaustion by Zabbix agent/winex.handles.max,24h)>last(/Windows resource exhaustion by Zabbix agent/winex.handles.max)*{$WINEX.GROWTH.FACTOR}'
-      event_name: '{{ITEM.LASTVALUE8}.regsub("^([^=,]+)", \1)} on {HOST.NAME} keeps taking handles: floor up {ITEM.LASTVALUE9} in 12h'
+      event_name: '{{ITEM.LASTVALUE8}.regsub("^([^=,]+)", \1)} on {HOST.NAME} keeps taking handles: floor up {ITEM.LASTVALUE9} in 12h at onset'
       opdata: 'busiest now {ITEM.LASTVALUE1}, floor +{ITEM.LASTVALUE9} in 12h; top: {{ITEM.LASTVALUE8}.regsub("(.*)", \1)}'
       priority: HIGH
       manual_close: 'YES'
+      url_name: 'Handle items on this host'
+      url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=Handles&filter_set=1'
       description: |
         A leak is the absence of a return to baseline, not a large number, so this compares the
         process's own recent floors instead of testing a threshold. Three clauses, each rejecting a
@@ -930,10 +932,29 @@ zabbix_export:
         only when the value has actually fallen away from its 24-hour peak - growth merely stopping is
         not recovery, because a leak that saturates against a ceiling stops growing too. manual_close
         is on for a leak that is known and accepted.
+
+        What to do with it. The event names the process and its PID; the operational data ranks the
+        five largest holders, so the first question - is one process running away or is the whole host
+        drifting up - is already answered in the alert. Then, on the host: Process Explorer or
+        handle.exe -p <PID> shows which handle type is accumulating, and the type is the diagnosis
+        (Event and Thread point at a process that never signals or joins, Key at a configuration
+        reader, File and ALPC Port at an unclosed client). Cross-read the two kernel pool items of this
+        template: a handle leak that is also lifting nonpaged pool is consuming kernel memory and
+        bounds the whole machine rather than one process. Restarting the process is the only immediate
+        mitigation - a handle table is never reclaimed while the process lives - and it resets this
+        trigger's windows too, so a leak that returns confirms itself within a day.
+
+        The {ITEM.LASTVALUE<N>} indices in the event name and operational data are positional: Zabbix
+        numbers them by textual occurrence of each function call in the expression, then the recovery
+        expression, counting a repeated call every time it appears. Editing the expression silently
+        renumbers them, with no error and no unsupported-item state - the name simply starts printing
+        a number where the process name was. Recount them after any change to either expression.
       dependencies:
         - name: 'Process probe: no data'
           expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.handles.total,{$WINEX.NODATA.PERIOD})=1'
       tags:
+        - tag: process
+          value: '{{ITEM.VALUE8}.regsub("^([^=,]+)", \1)}'
         - tag: component
           value: os
         - tag: scope
