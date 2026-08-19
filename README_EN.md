@@ -127,7 +127,7 @@ one API call, from the problem to the PID lookup.
 | `{$WINEX.SOCK.BOUND.FLOOR}` | `500` | Bound sockets a host must already hold before the port forecast may speak. The forecast only: the leak detectors carry no floor |
 | `{$WINEX.SOCK.CLOSEWAIT.MAX}` | `200` | CLOSE_WAIT sockets host-wide |
 | `{$WINEX.SOCK.TIMEWAIT.PCT}` | `25` | TIME_WAIT as a percent of the discovered port range, which is what they compete for |
-| `{$WINEX.WMI.TIMEOUT}` | `15s` | WMI item timeout |
+| `{$WINEX.WMI.TIMEOUT}` | `30s` | WMI item timeout. The Zabbix ceiling for an agent item; the cost of enumerating connections scales with their number, so there is nothing above this |
 
 Pool ceilings are a share of memory rather than a byte count, because on x64 it is memory that bounds
 the nonpaged pool. A fixed ceiling is wrong in both directions at once: tight on a large host that
