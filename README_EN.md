@@ -113,13 +113,20 @@ one API call, from the problem to the PID lookup.
 1. Import `template/template_windows_resource_exhaustion.yaml`
    (`Data collection → Templates → Import`, `Create new` + `Update existing`, `Delete missing` off).
 2. Link it to Windows hosts **in addition** to the stock template, not instead of it.
-3. There is nothing to calibrate and nowhere to calibrate it: the leak detectors compare a host with
-   itself. They reach full sensitivity a day after linking, when the longest window fills, and catch a
-   steep climb sooner than that. Before that a detector is **OK**,
-   not Unknown: the clause order is chosen so that Zabbix stops evaluating at the first false term and
-   never reaches a shifted window or a calculated item that does not exist yet. That guarantee starts
-   at the first stored value; between linking and that value every trigger in every template is
-   Unknown, and this one is not special.
+3. Walk the hosts where `Handles in one process are above the ceiling` fired and decide once, per
+   host: legitimately large holder, or finding. If legitimate, override `{$WINEX.HANDLES.CEILING}` on
+   the host. That is the only threshold that may ever need an override: ports and pool are shares of
+   what the host reports about itself — the discovered port range and measured memory — while a handle
+   count has no denominator anywhere in Windows. The norm belongs to the process name, not the host:
+   `dns.exe` holds 10 400 on every controller, a healthy `lsass.exe` holds 2 000–2 500, `searchd`
+   legitimately holds 40 000–58 000. No formula covers all of them: a share of the 16 777 216
+   per-process cap sits four orders of magnitude above anything observed, and comparing a host with
+   itself fires on a fifty-handle move.
+   The handle ceiling reaches full sensitivity a day after linking, when the 24-hour window fills.
+   Before that the trigger is silent and stays **OK**, not Unknown: the clause order is chosen so that
+   Zabbix stops evaluating at the first false term. That guarantee starts at the first stored value;
+   between linking and that value every trigger in every template is Unknown, and this one is not
+   special.
 
 ## How alerts close
 
