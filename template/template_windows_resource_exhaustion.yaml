@@ -30,13 +30,26 @@ zabbix_export:
         from the registry (ignored by Windows since Vista), and anything the stock Windows template
         already provides.
 
-        Alerting principle: a leak is the absence of a return to baseline, not a large number. There is
-        no absolute threshold for how many handles or sockets a process may hold, because normal counts
-        differ between server roles by two orders of magnitude and any default is wrong on most of a
-        fleet. Each leak detector compares a host with itself: the floor of the last six hours against
-        the floor of the last twelve, that against the floor of the last day, and the last six hours
-        against the highest reading of the six before them. Thresholds survive only where the ceiling
-        is physical - kernel pool as a share of RAM, and headroom in the discovered port range.
+        Alerting principle: an alert must name a limit. Four growth detectors used to live here, each
+        asking whether a floor was climbing; they were deleted on 2026-08-20 after two days on 28 real
+        servers, where the handle rule alone held nine hosts under a High at once and reopened on three
+        of them within two hours, while nothing on the fleet was closer than thirty-five days to any
+        limit. Growth on a resource with 97 percent headroom is a graph, not an alert. What remains is
+        a ceiling per resource (kernel pool as a share of RAM, headroom in the discovered port range,
+        one process's 24-hour handle floor), a timeleft forecast on ports where the horizon is shorter
+        than the history, and the event log where Windows reports the failure itself.
+
+        The handle ceiling is the one number here not derived from physics, and normal counts differ
+        between server roles by two orders of magnitude. Where a host legitimately runs a large holder,
+        override {$WINEX.HANDLES.CEILING} on that host. That decision is made once, by a person, and it
+        is the whole calibration this template needs.
+
+        PENDING 2026-09-10: handles and kernel pool have no forecast. Building one needs history deeper
+        than the horizon it projects - on three days of data, timeleft over a 48-hour window disagreed
+        with itself by a factor of twenty. Once two weeks have accumulated, revisit with trendmin plus
+        timeleft over a seven-day window; trendavg, trendmin, timeleft, forecast, baselinewma and
+        baselinedev all exist in Zabbix 7.0, median() does not. Until then a leak is not reported before
+        it reaches its ceiling - on the fleet this was measured against, 73 and 82 days on two hosts.
 
         Known limitation: Zabbix cannot join two master items, so socket alerts carry PIDs while process
         names live in "Processes: PID to name map". Every socket trigger links straight to it.
@@ -49,10 +62,9 @@ zabbix_export:
         - The server or proxy must reach the agent for passive checks. The event log item is the one
           exception: eventlog[] is an active-only key and stays silent where active checks are not set up.
         - Link IN ADDITION to the stock Windows template, not instead of it.
-        - The leak detectors read item history, not trends. They need twelve hours of it to be fully
-          armed after linking, and report OK rather than Unknown before that. Shortening history below
-          12h on winex.handles.max, winex.sock.bound or the two pool counters disables them silently -
-          that is the one setting to leave alone. Trends are irrelevant to them.
+        - The handle ceiling reads item history, not trends. It needs 24 hours of it to be fully armed
+          after linking, and reports OK rather than Unknown before that. Shortening history below 24h
+          on winex.handles.max disables it silently - that is the one setting to leave alone.
         - {$WINEX.WMI.TIMEOUT} defaults to 30s, the Zabbix ceiling for an agent item, because the cost
           of enumerating MSFT_NetTCPConnection scales with the connection count: measured at roughly
           4-5 ms per connection, 15s was exceeded on a host holding ~3900 and 30s still served 5494.
