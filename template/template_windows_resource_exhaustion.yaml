@@ -21,7 +21,8 @@ zabbix_export:
         - the dynamic port range as Windows actually has it, and the headroom left in it;
         - handles: system total, busiest process, top processes as "name (PID)=count";
         - kernel pool: nonpaged and paged;
-        - Windows events 4227 / 4231, the authoritative "ephemeral ports exhausted" signal.
+        - Windows event 4227, the authoritative "ephemeral ports exhausted" signal, and 4231,
+          which is not that and is collected apart from it.
 
         Two WMI table probes every five minutes, both with history 0 - the raw JSON is never stored.
 
@@ -87,7 +88,7 @@ zabbix_export:
         License: MIT (c) 2026 Konstantin Tyutyunnik
       vendor:
         name: itforprof.com
-        version: 1.1.0
+        version: 1.2.0
       groups:
         - name: Templates/Operating systems
       items:
@@ -419,24 +420,49 @@ zabbix_export:
           tags:
             - tag: component
               value: os
-        - uuid: 7723f063cc3d45a7b4e6b3ba81e31d89
-          name: 'Windows events: TCP port exhaustion'
-          key: 'eventlog[System,,,,^(4227|4231)$,,skip]'
+        - uuid: 7f380a61d7e64b9baff3a1d860503e67
+          name: 'Windows events: dynamic port range exhausted (4227)'
+          key: 'eventlog[System,,,,^4227$,,skip]'
           type: ZABBIX_ACTIVE
           delay: 1m
           history: 7d
           value_type: LOG
           description: |
-            Events 4227 and 4231 are Windows stating outright that it could not allocate an ephemeral
-            port. This is confirmation of a failure already in progress, not an early warning: the port
-            headroom and forecast triggers fire while ports still remain. Its value is that it is the
-            only port signal independent of the macro-declared range, so it still fires when the
-            headroom arithmetic is wrong. The event text is system-wide and does not name a process.
+            Event 4227 is Windows stating outright that it ran out of ephemeral ports. Confirmation of
+            a failure already in progress, not an early warning: the headroom and forecast triggers
+            fire while ports still remain. Its value is that it is the only port signal independent of
+            the macro-declared range, so it still fires when the headroom arithmetic is wrong. The
+            event text is system-wide and does not name a process.
+            It is collected separately from 4231 because the two are different failures needing
+            different responses, and {ITEM.LOG.EVENTID} resolves only in notifications - not in an
+            event name and not in operational data - so one item carrying both could not say which
+            had happened without a human reading the message text.
             A healthy host produces nothing here, so an empty item is the normal state and no nodata
             trigger is attached to it.
             eventlog[] is an ACTIVE-ONLY key. On a host that does not run active checks this item stays
             empty for ever and is indistinguishable from a healthy one - confirm active checks are
             configured before relying on this signal. Everything else in this template is passive.
+          tags:
+            - tag: component
+              value: network
+            - tag: scope
+              value: capacity
+        - uuid: 7723f063cc3d45a7b4e6b3ba81e31d89
+          name: 'Windows events: local endpoint reused too fast (4231)'
+          key: 'eventlog[System,,,,^4231$,,skip]'
+          type: ZABBIX_ACTIVE
+          delay: 1m
+          history: 7d
+          value_type: LOG
+          description: |
+            Event 4231 is a 4-tuple reuse: one local endpoint hitting one remote endpoint faster than
+            TIME_WAIT drains. It is not range exhaustion and fires with the range almost empty - on the
+            fleet this was measured against, both occurrences came from hosts using under 5 % of their
+            dynamic range.
+            Separate from 4227 on purpose. The two events arrive on the same log and matched the same
+            item until 2026-08-20, which made every occurrence read as port exhaustion at High
+            severity; the two that arrived were both this one, and neither needed an operator.
+            eventlog[] is an ACTIVE-ONLY key, same caveat as its 4227 sibling.
           tags:
             - tag: component
               value: network
@@ -826,27 +852,48 @@ zabbix_export:
           value: network
         - tag: scope
           value: availability
-    - uuid: 1c0ea932ec8442f6aac7638ee1d34c2f
-      expression: 'count(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^(4227|4231)$,,skip],30m)>0'
+    - uuid: fc3c401634b0424c8d137538b54a4fa4
+      expression: 'count(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^4227$,,skip],30m)>0'
       recovery_mode: RECOVERY_EXPRESSION
-      recovery_expression: 'nodata(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^(4227|4231)$,,skip],1h)=1'
-      name: 'Windows confirms TCP port exhaustion'
-      event_name: 'Windows on {HOST.NAME} logged a port-exhaustion event: {{ITEM.LASTVALUE1}.regsub("(.*)", \1)}'
+      recovery_expression: 'nodata(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^4227$,,skip],1h)=1'
+      name: 'Windows confirms the dynamic port range is exhausted'
+      event_name: 'Windows on {HOST.NAME} could not allocate an ephemeral port (event 4227)'
       priority: HIGH
       description: |
-        Events 4227 / 4231 - Windows has already failed to hand out a port. Confirmation, not early
-        warning: the headroom and forecast triggers fire earlier, and this one does not name a process.
-        The two events are not the same failure and only 4227 is range exhaustion. 4231 is a 4-tuple
-        reuse - one local endpoint hitting one remote endpoint faster than TIME_WAIT drains - and it
-        fires with the range almost empty: observed on a host with 98.6% of its dynamic range free and
-        TIME_WAIT at 2.2% of it, far under {$WINEX.SOCK.TIMEWAIT.PCT}. So a headroom trigger that stayed
-        quiet here is not a miss, and the fix is connection reuse in the application, not a wider range.
-        The event text in the event name says which of the two it was; read it before widening anything.
-        It earns its place by being the only port signal that does not depend on the macro-declared
-        range being correct.
+        Event 4227 - Windows has already failed to hand out a port from the dynamic range. Confirmation,
+        not early warning: the headroom and forecast triggers fire earlier, and this one does not name a
+        process. It earns its place by being the only port signal that does not depend on the
+        macro-declared range being correct, so it still fires when the headroom arithmetic is wrong.
+        High because the host is out of ports right now and new outbound connections are failing.
         No parent trigger: it rides the active-check transport, which fails independently of the
         passive WMI probes. Recovery is time-based because count() alone would latch this trigger in
         PROBLEM for ever - an event-log item produces values only during an incident.
+      url_name: 'PID to name map'
+      url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
+      tags:
+        - tag: pidmap_item
+          value: winex.proc.pidmap
+        - tag: component
+          value: network
+        - tag: scope
+          value: capacity
+    - uuid: 1c0ea932ec8442f6aac7638ee1d34c2f
+      expression: 'count(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^4231$,,skip],30m)>0'
+      recovery_mode: RECOVERY_EXPRESSION
+      recovery_expression: 'nodata(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^4231$,,skip],1h)=1'
+      name: 'Local endpoint reused faster than TIME_WAIT drains'
+      event_name: 'Windows on {HOST.NAME} rejected an outbound connection reusing a recent 4-tuple (event 4231)'
+      priority: WARNING
+      description: |
+        Event 4231 - one local endpoint hitting one remote endpoint faster than TIME_WAIT drains. Not
+        range exhaustion: it fires with the range almost empty, observed on a host with 98.6% of its
+        dynamic range free and TIME_WAIT at 2.2% of it, far under {$WINEX.SOCK.TIMEWAIT.PCT}. So a
+        headroom trigger that stayed quiet here is not a miss, and widening the range with netsh
+        changes nothing - the fix is connection reuse in the application.
+        Warning rather than High, and split away from 4227 for that reason. Until 2026-08-20 both
+        events matched one item and one High trigger; the only two occurrences the fleet produced were
+        both this event, and neither needed an operator to do anything at the time it arrived.
+        No parent trigger, and time-based recovery, for the same reasons as its 4227 sibling.
       url_name: 'PID to name map'
       url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
       tags:
@@ -896,9 +943,13 @@ zabbix_export:
         that many all day. On the fleet this was measured against, that single change was the
         difference between reporting three hosts and reporting five, two of them mail servers whose
         working peak is four times their floor.
-        The ceiling is a fleet-relative number, not a Windows limit - the per-process limit is
-        16777216 and nothing reaches it. What bounds the machine first is kernel memory, and the two
-        pool items of this template carry that; cross-read them before restarting anything.
+        The ceiling is not a Windows limit - the per-process limit is 16777216 and nothing reaches
+        it. Nor is it one number the fleet shares: the largest holder is a different binary on
+        almost every host, and a search indexer holding 50000 is as healthy as an lsass holding
+        2500. The norm belongs to the process, so the number belongs to the host, and the default
+        only has to be low enough that the hosts needing their own answer announce themselves once.
+        What bounds the machine first is kernel memory, and the two pool items of this template
+        carry that; cross-read them before restarting anything.
         It is Average, not High: a standing high count is something to schedule a restart for, not to
         wake up for. Where a host has a legitimately large holder, override {$WINEX.HANDLES.CEILING}
         on that host rather than switching the trigger off. That decision is made once, by a person,

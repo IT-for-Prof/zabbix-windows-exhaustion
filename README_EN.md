@@ -41,7 +41,7 @@ dependent items.
 | **Dynamic ports** | free headroom. The range is **discovered** from `MSFT_NetTCPSetting`, never declared as a macro |
 | **Handles** | total, per-process maximum, top 5 as `name (PID)=count` |
 | **Kernel pool** | nonpaged and paged, in bytes and as a **share of physical memory** |
-| **Windows events** | 4227 / 4231 — the system stating outright that ports ran out |
+| **Windows events** | 4227 — the system stating outright that ports ran out; 4231 — 4-tuple reuse, which is not that |
 | **Reference** | a `PID=name` map sorted by PID, to decode socket alerts |
 
 Plus three graphs: sockets by state, handles and pool, and port headroom against the discovered range.
@@ -77,7 +77,8 @@ That decision is made once, by a person, in daylight, and it is the whole calibr
 
 | Trigger | Severity | Logic |
 |---|---|---|
-| Windows confirms TCP port exhaustion | High | event 4227/4231 — the failure already happened. Confirmation, not early warning |
+| Windows confirms the dynamic port range is exhausted | High | event 4227 — no ports left in the range, outbound connections are failing now |
+| Local endpoint reused faster than TIME_WAIT drains | Warning | event 4231 — 4-tuple reuse. The range is nearly empty when it fires; the fix is in the application, not a wider range |
 | Dynamic port range is running out | High | free ports below `{$WINEX.PORTS.FREE.PCT}` % of the discovered range |
 | Dynamic port range will run out | Warning | `timeleft` on port headroom < `{$WINEX.PORTS.TIMELEFT}` |
 | Connections are not being closed | Warning | CLOSE_WAIT above threshold, offending PID in `opdata` |
@@ -143,8 +144,8 @@ process's 24-hour floor below `{$WINEX.HANDLES.CEILING}`. A process that gets re
 alert within a day - exactly the time the new, lower value needs to push the old one out of the
 24-hour window. `manual_close` is on where closing by hand makes sense.
 
-`Windows confirms TCP port exhaustion` closes itself 30 minutes after the last log entry: it reports a
-fact, not a state.
+Both event-log triggers close themselves 30 minutes after the last log entry: they report a fact,
+not a state.
 
 ## Macros
 
