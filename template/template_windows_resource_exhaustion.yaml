@@ -407,32 +407,6 @@ zabbix_export:
           tags:
             - tag: component
               value: os
-        - uuid: 5f2c1a94e0b64d3b9a71c8e2d4067b15
-          name: 'Handles: 12h growth of the floor'
-          key: winex.handles.growth
-          type: CALCULATED
-          history: 31d
-          params: 'last(//winex.handles.max)-min(//winex.handles.max,12h)'
-          delay: '{$WINEX.PROBE.INTERVAL}'
-          description: |
-            How many handles the busiest process has gained over the last twelve hours: the current
-            reading minus the lowest one in that window. The number an operator actually needs during
-            a leak, and the one a raw counter never shows - a count of 38392 handles says nothing
-            without knowing it was 24000 half a day ago.
-            It was briefly the difference between the 6-hour and the 12-hour floor, which on a
-            monotone climb measures the rise during the six hours *ending* six hours ago and so
-            reports about half the real gain. The alert said "up 6693 in 12h" while the process had
-            actually taken 14110 in that time. Same shape of arithmetic, wrong number in front
-            of a person deciding how urgent this is.
-            last() sits inside the window it is compared against, so the value can never be negative
-            and neither term can be empty while the other holds data - the item cannot go unsupported
-            on a freshly linked host. With a single sample both terms are that sample and the value
-            is 0, which is also what the leak trigger needs to stay quiet during warm-up.
-          tags:
-            - tag: component
-              value: os
-            - tag: scope
-              value: capacity
         - uuid: 7723f063cc3d45a7b4e6b3ba81e31d89
           name: 'Windows events: TCP port exhaustion'
           key: 'eventlog[System,,,,^(4227|4231)$,,skip]'
@@ -720,9 +694,9 @@ zabbix_export:
         - tag: vendor
           value: microsoft
       macros:
-        - macro: '{$WINEX.GROWTH.FACTOR}'
-          value: '1.05'
-          description: 'How far a floor must rise to count as a leak, applied twice: the 6-hour floor against the 12-hour, and the 12-hour against the day. It is deliberately small - specificity comes from the three clauses agreeing, not from a large ratio, and a large ratio is what makes a slow leak on a big baseline invisible. Raise it only if a genuinely growing workload is being reported.'
+        - macro: '{$WINEX.HANDLES.CEILING}'
+          value: '100000'
+          description: 'Handles one process may hold before it is reported regardless of trend, measured on its 24-hour floor so that churn cannot trip it. It exists because a rate rule cannot see a leak that already saturated, and because a process whose count swings by more than it grows in six hours never satisfies the growth clauses at all - on the fleet this was measured against, the single largest holder (a svchost at 489000) was invisible to every rate. Measured reference: the largest floor on a healthy host was a search indexer at 58000, so this leaves about 70 percent headroom. Raise it on a host with a legitimately huge holder rather than switching the trigger off.'
         - macro: '{$WINEX.NODATA.PERIOD}'
           value: 15m
           description: 'Silence tolerated on a probe before it is reported. Keep it at least three times {$WINEX.PROBE.INTERVAL}.'
@@ -759,7 +733,7 @@ zabbix_export:
       name: 'Socket probe: no data'
       event_name: 'Socket probe on {HOST.NAME} has been silent for {$WINEX.NODATA.PERIOD}'
       opdata: 'last seen: {ITEM.LASTVALUE1} sockets'
-      priority: AVERAGE
+      priority: WARNING
       description: |
         Root of the socket chain. Each collection chain - sockets, processes, kernel pool, and the
         event log - has its own root on purpose: a dependency here means "the parent's failure makes
@@ -783,7 +757,7 @@ zabbix_export:
       name: 'Process probe: no data'
       event_name: 'Process probe on {HOST.NAME} has been silent for {$WINEX.NODATA.PERIOD}'
       opdata: 'last seen: {ITEM.LASTVALUE1} handles'
-      priority: AVERAGE
+      priority: WARNING
       description: 'Root of the process chain. It has no parent on purpose: the cimv2 probe fails independently of the socket probe, and chaining them would let a stalled socket query silence a live handle leak.'
       tags:
         - tag: component
@@ -795,7 +769,7 @@ zabbix_export:
       name: 'Kernel pool: no data'
       event_name: 'Kernel pool counters on {HOST.NAME} have been silent for {$WINEX.NODATA.PERIOD}'
       opdata: 'last seen: nonpaged {ITEM.LASTVALUE1}, paged {ITEM.LASTVALUE2}'
-      priority: AVERAGE
+      priority: WARNING
       description: 'Root of the kernel-pool chain, watching the raw counters themselves. It deliberately does NOT watch the derived ratio items: those are also fed by the memory reading, and a chain must be watched at its own source or a failure somewhere else silences it. No parent, because the pool rides perf_counter_en rather than WMI - a WMI stall must not silence alerts whose data is still arriving.'
       tags:
         - tag: component
@@ -807,7 +781,7 @@ zabbix_export:
       name: 'Kernel pool ratio: no data'
       event_name: 'Kernel pool ratios on {HOST.NAME} cannot be computed'
       opdata: 'last seen: nonpaged {ITEM.LASTVALUE1} of RAM, paged {ITEM.LASTVALUE2} of RAM'
-      priority: AVERAGE
+      priority: WARNING
       description: |
         The percentage ceilings need both a counter and a memory reading. This watches the derived
         items and the denominator, so a memory query that stops arriving is reported instead of
@@ -827,7 +801,7 @@ zabbix_export:
       name: 'Port range probe: no data'
       event_name: 'Dynamic port range on {HOST.NAME} has not been measured for {$WINEX.NODATA.PERIOD}'
       opdata: 'range last seen: {{ITEM.LASTVALUE1}.regsub("StartPort[^0-9]+([0-9]+)", \1)} + {{ITEM.LASTVALUE1}.regsub("NumberOfPorts[^0-9]+([0-9]+)", \1)} ports'
-      priority: AVERAGE
+      priority: WARNING
       description: |
         Root of the port-range chain. Without it this is the one collection path with no liveness
         cover: the headroom item hangs off the socket probe, so a failure confined to this query
@@ -870,33 +844,6 @@ zabbix_export:
           value: network
         - tag: scope
           value: capacity
-    - uuid: db05ba62563e4c1ead60d703ed7bf5cb
-      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,6h)>min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,12h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,12h)>min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,24h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,6h)>max(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,6h:now-6h) and length(last(/Windows resource exhaustion by Zabbix agent/winex.sock.bound.top))>0'
-      name: 'Bound sockets are not returning to baseline'
-      recovery_mode: RECOVERY_EXPRESSION
-      recovery_expression: 'max(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,24h)>last(/Windows resource exhaustion by Zabbix agent/winex.sock.bound)*{$WINEX.GROWTH.FACTOR}'
-      event_name: 'Bound sockets on {HOST.NAME} are not returning to baseline ({ITEM.LASTVALUE1} now)'
-      opdata: 'Bound now {ITEM.LASTVALUE1}; top: {{ITEM.LASTVALUE8}.regsub("(.*)", \1)}'
-      priority: WARNING
-      manual_close: 'YES'
-      description: |
-        The socket half of the rule described on the handle trigger, and the only socket leak detector
-        here: the real ceiling for sockets is the dynamic port range, which has its own relative
-        triggers. The clause requiring the 6-hour floor to clear the preceding six hours outright is
-        what keeps this quiet on the common Windows pattern of a connection pool that fills and
-        recycles on a fixed period.
-      dependencies:
-        - name: 'Socket probe: no data'
-          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent/winex.sock.total)>=0'
-      url_name: 'PID to name map'
-      url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
-      tags:
-        - tag: pidmap_item
-          value: winex.proc.pidmap
-        - tag: component
-          value: network
-        - tag: scope
-          value: capacity
     - uuid: 361ed86a3ddd49ae907871108c4fcc62
       expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.close_wait,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.sock.close_wait,15m)>{$WINEX.SOCK.CLOSEWAIT.MAX} and length(last(/Windows resource exhaustion by Zabbix agent/winex.sock.close_wait.top))>0'
       name: 'Connections are not being closed'
@@ -916,62 +863,40 @@ zabbix_export:
           value: network
         - tag: scope
           value: capacity
-    - uuid: ce13acac58d84d6e886ebfccfae77e28
-      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.handles.max,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,6h)>min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,12h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,12h)>min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,24h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,6h)>max(/Windows resource exhaustion by Zabbix agent/winex.handles.max,6h:now-6h) and length(last(/Windows resource exhaustion by Zabbix agent/winex.handles.top))>0 and last(/Windows resource exhaustion by Zabbix agent/winex.handles.growth)>0'
-      name: 'Handles are not returning to baseline'
-      recovery_mode: RECOVERY_EXPRESSION
-      recovery_expression: 'max(/Windows resource exhaustion by Zabbix agent/winex.handles.max,24h)>last(/Windows resource exhaustion by Zabbix agent/winex.handles.max)*{$WINEX.GROWTH.FACTOR}'
-      event_name: '{{ITEM.LASTVALUE8}.regsub("^([^=,]+)", \1)} on {HOST.NAME} keeps taking handles: floor up {ITEM.LASTVALUE9} in 12h at onset'
-      opdata: 'busiest now {ITEM.LASTVALUE1}, floor +{ITEM.LASTVALUE9} in 12h; top: {{ITEM.LASTVALUE8}.regsub("(.*)", \1)}'
-      priority: HIGH
+    - uuid: 4a9d61c0f7b84e2ea3d5b8091c6e7f34
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.handles.max,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,24h)>{$WINEX.HANDLES.CEILING} and length(last(/Windows resource exhaustion by Zabbix agent/winex.handles.top))>0'
+      name: 'Handles in one process are above the ceiling'
+      event_name: '{{ITEM.LASTVALUE3}.regsub("^([^=,]+)", \1)} on {HOST.NAME} holds {ITEM.LASTVALUE1} handles'
+      opdata: 'top: {{ITEM.LASTVALUE3}.regsub("(.*)", \1)}'
+      priority: AVERAGE
       manual_close: 'YES'
       url_name: 'Handle items on this host'
       url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=Handles&filter_set=1'
       description: |
-        A leak is the absence of a return to baseline, not a large number, so this compares the
-        process's own recent floors instead of testing a threshold. Three clauses, each rejecting a
-        different shape that is not a leak:
-        - the 6-hour floor must clear the 12-hour floor: something is climbing now;
-        - the 12-hour floor must clear the day's floor: the climb survives a full daily cycle. Without
-          this an ordinary business-hours server alerts every afternoon, when its last six hours are
-          the working ramp and the six before them are the night trough;
-        - the 6-hour window must sit entirely above the highest reading of the preceding six hours,
-          which rejects a plateau after a restart and a pool that recycles on a fixed period.
-        There is no floor macro and no absolute number: a floor low enough to be harmless changes no
-        verdict, and one high enough to matter stops evaluation before the growth clauses run, which
-        is a threshold under another name.
-        Clause order is load-bearing. Zabbix stops evaluating an "and" chain at the first false term,
-        and the two nested-window comparisons lead because the shorter window is always a subset of the
-        longer, so they cannot fail on missing data. Only once they hold does evaluation reach the
-        shifted max() window or the calculated growth item, either of which can be empty on a young
-        host. From the first stored value onward the trigger is OK or PROBLEM, never Unknown.
-        Full sensitivity arrives 24 hours after linking; a steep climb is reported sooner. It closes
-        only when the value has actually fallen away from its 24-hour peak - growth merely stopping is
-        not recovery, because a leak that saturates against a ceiling stops growing too. manual_close
-        is on for a leak that is known and accepted.
-
-        What to do with it. The event names the process and its PID; the operational data ranks the
-        five largest holders, so the first question - is one process running away or is the whole host
-        drifting up - is already answered in the alert. Then, on the host: Process Explorer or
-        handle.exe -p <PID> shows which handle type is accumulating, and the type is the diagnosis
-        (Event and Thread point at a process that never signals or joins, Key at a configuration
-        reader, File and ALPC Port at an unclosed client). Cross-read the two kernel pool items of this
-        template: a handle leak that is also lifting nonpaged pool is consuming kernel memory and
-        bounds the whole machine rather than one process. Restarting the process is the only immediate
-        mitigation - a handle table is never reclaimed while the process lives - and it resets this
-        trigger's windows too, so a leak that returns confirms itself within a day.
-
-        The {ITEM.LASTVALUE<N>} indices in the event name and operational data are positional: Zabbix
-        numbers them by textual occurrence of each function call in the expression, then the recovery
-        expression, counting a repeated call every time it appears. Editing the expression silently
-        renumbers them, with no error and no unsupported-item state - the name simply starts printing
-        a number where the process name was. Recount them after any change to either expression.
+        The one question worth asking of a handle count: is the number itself outside anything a
+        healthy process on this host does. Not whether it is climbing. A rate detector shipped here
+        for two days and reported nine of twenty-eight hosts at once while the nearest real
+        consequence was thirty-five days away, reopening on three of them within two hours. Growth
+        on a resource with ninety-seven percent headroom is a graph, not an alert, and no threshold
+        makes it one.
+        It reads the 24-hour floor rather than the last value, so a process that peaks high and falls
+        back every day is not reported for its peaks; the floor being above the ceiling means it holds
+        that many all day. On the fleet this was measured against, that single change was the
+        difference between reporting three hosts and reporting five, two of them mail servers whose
+        working peak is four times their floor.
+        The ceiling is a fleet-relative number, not a Windows limit - the per-process limit is
+        16777216 and nothing reaches it. What bounds the machine first is kernel memory, and the two
+        pool items of this template carry that; cross-read them before restarting anything.
+        It is Average, not High: a standing high count is something to schedule a restart for, not to
+        wake up for. Where a host has a legitimately large holder, override {$WINEX.HANDLES.CEILING}
+        on that host rather than switching the trigger off. That decision is made once, by a person,
+        in daylight, and it is the whole calibration this detector needs.
       dependencies:
         - name: 'Process probe: no data'
           expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.handles.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent/winex.handles.total)>=0'
       tags:
         - tag: process
-          value: '{{ITEM.VALUE8}.regsub("^([^=,]+)", \1)}'
+          value: '{{ITEM.VALUE3}.regsub("^([^=,]+)", \1)}'
         - tag: component
           value: os
         - tag: scope
@@ -998,27 +923,6 @@ zabbix_export:
           value: memory
         - tag: scope
           value: capacity
-    - uuid: a21cff1b44424aab8fab8fe8ecb15ca1
-      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],6h)>min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],12h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],12h)>min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],24h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],6h)>max(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],6h:now-6h)'
-      name: 'Nonpaged pool is not returning to baseline'
-      recovery_mode: RECOVERY_EXPRESSION
-      recovery_expression: 'max(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],24h)>last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])*{$WINEX.GROWTH.FACTOR}'
-      event_name: 'Nonpaged pool on {HOST.NAME} keeps growing: its 6h floor is {$WINEX.GROWTH.FACTOR}x its 12h floor'
-      opdata: 'nonpaged pool now: {ITEM.LASTVALUE1}'
-      priority: WARNING
-      manual_close: 'YES'
-      description: |
-        The nonpaged half of the pool detector - the rule described on the handle trigger. Nonpaged
-        pool is the scarcer of the two and the one a driver leak consumes, so a floor that climbs and
-        does not return is worth knowing about well before the ceiling trigger fires.
-      dependencies:
-        - name: 'Kernel pool: no data'
-          expression: '(nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])>=0 and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60])>=0'
-      tags:
-        - tag: component
-          value: memory
-        - tag: scope
-          value: capacity
     - uuid: 6b5869e9585f49a18ac50c4531299b4b
       expression: 'min(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct,10m)>{$WINEX.POOL.PAGED.PCT} and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60])>=0'
       name: 'Paged pool above the ceiling'
@@ -1032,30 +936,6 @@ zabbix_export:
       tags:
         - tag: bytes_item
           value: 'perf_counter_en["\Memory\Pool Paged Bytes",60]'
-        - tag: component
-          value: memory
-        - tag: scope
-          value: capacity
-    - uuid: 193e2e85c2a54989903c62f6fc319438
-      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],6h)>min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],12h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],12h)>min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],24h)*{$WINEX.GROWTH.FACTOR} and min(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],6h)>max(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],6h:now-6h)'
-      name: 'Paged pool is not returning to baseline'
-      recovery_mode: RECOVERY_EXPRESSION
-      recovery_expression: 'max(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],24h)>last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60])*{$WINEX.GROWTH.FACTOR}'
-      event_name: 'Paged pool on {HOST.NAME} keeps growing: its 6h floor is {$WINEX.GROWTH.FACTOR}x its 12h floor'
-      opdata: 'paged pool now: {ITEM.LASTVALUE1}'
-      priority: WARNING
-      manual_close: 'YES'
-      description: |
-        Pool leaks are slow, so this compares floors rather than peaks - the rule described on the
-        handle trigger. Paged pool also has an absolute ceiling as a share of RAM; this is the early
-        signal that fires while the ceiling still has headroom.
-        A workload step is not a leak: a terminal server filling up in the morning raises its 6-hour
-        floor every day, which is why the clause comparing the 12-hour floor with the day's is what
-        decides here.
-      dependencies:
-        - name: 'Kernel pool: no data'
-          expression: '(nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])>=0 and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60])>=0'
-      tags:
         - tag: component
           value: memory
         - tag: scope
@@ -1107,11 +987,6 @@ zabbix_export:
           item:
             host: Windows resource exhaustion by Zabbix agent
             key: winex.handles.max
-        - sortorder: '4'
-          color: BB2222
-          item:
-            host: Windows resource exhaustion by Zabbix agent
-            key: winex.handles.growth
         - sortorder: '2'
           color: F63100
           yaxisside: RIGHT

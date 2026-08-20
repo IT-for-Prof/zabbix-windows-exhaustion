@@ -39,7 +39,7 @@ dependent items.
 | **Sockets** | total, established, CLOSE_WAIT, TIME_WAIT, **Bound** from `MSFT_NetTCPConnection` |
 | **Who holds them** | top 5 processes by Bound and by CLOSE_WAIT, formatted for trigger `opdata` |
 | **Dynamic ports** | free headroom. The range is **discovered** from `MSFT_NetTCPSetting`, never declared as a macro |
-| **Handles** | system total, busiest process, top 5 as `name (PID)=count`, and **how far the floor rose in 12h** — the number an alert is useless without |
+| **Handles** | total, per-process maximum, top 5 as `name (PID)=count` |
 | **Kernel pool** | nonpaged and paged, in bytes and as a **share of physical memory** |
 | **Windows events** | 4227 / 4231 — the system stating outright that ports ran out |
 | **Reference** | a `PID=name` map sorted by PID, to decode socket alerts |
@@ -55,33 +55,41 @@ restarts: the absolute trigger recovers within its own window, the forecast need
 
 ## What it alerts on
 
-One principle: **a leak is not a large number, it is the absence of a return to baseline.**
-There is no absolute threshold here for how many handles or sockets a process may hold: across 28
-mixed Windows servers the busiest process held between 1722 and 487426 handles, a spread of 283x, at
-which any default is wrong on most of a fleet and the per-host overrides it forces are worse than no
-trigger at all. The detectors carry no floors either: the three clauses below already ignore a process
-going from four handles to seven, and a floor that stops evaluation at the first clause on 26 hosts out
-of 28 is a threshold wearing another name. Thresholds survive only where the ceiling is physical — kernel pool as a share of
-RAM, and headroom in the dynamic port range.
+One principle: **an alert must name a limit.** Not "is it climbing" but "how far is this from the
+thing it runs out of". The difference is not philosophical: across 28 mixed Windows servers the growth
+detectors - there were four of them here - reported nine hosts at once, three of them reopening twice
+within two hours, while the nearest resource anywhere on the fleet was thirty-five days from any
+limit. Handles occupied 2.5% of their hard limit, ports 1.4% of the range, nonpaged pool 4.9% of RAM.
+Growth on a resource with 97% headroom is a graph, not an alert, and no threshold turns it into one.
+
+The growth detectors were therefore removed outright, leaving three kinds of condition:
+
+- **a ceiling** — a share of a physical limit: kernel pool against RAM, port headroom against the
+  discovered range, one process's handles against `{$WINEX.HANDLES.CEILING}`;
+- **a forecast** — `timeleft` to port exhaustion, the one place here where running out is real and fast;
+- **a fact** — Windows itself logged 4227/4231; the failure already happened.
+
+The handle ceiling is the only number here not derived from physics: the per-process limit is
+16777216 and nothing reaches it, kernel memory bounds the machine first. The fleet spread is 1722 to
+487426 handles for the busiest process, a factor of 283, so one default is not right everywhere.
+Where a host legitimately runs a large holder, override `{$WINEX.HANDLES.CEILING}` **on that host**.
+That decision is made once, by a person, in daylight, and it is the whole calibration this needs.
 
 | Trigger | Severity | Logic |
 |---|---|---|
 | Windows confirms TCP port exhaustion | High | event 4227/4231 — the failure already happened. Confirmation, not early warning |
 | Dynamic port range is running out | High | free ports below `{$WINEX.PORTS.FREE.PCT}` % of the discovered range |
 | Dynamic port range will run out | Warning | `timeleft` on port headroom < `{$WINEX.PORTS.TIMELEFT}` |
-| Bound sockets are not returning to baseline | Warning | the 6h floor clears the 12h floor, the 12h floor clears the day's (both by `{$WINEX.GROWTH.FACTOR}`) **and** the 6h window sits above all of the preceding 6h. The middle clause is what separates a leak from a working day |
 | Connections are not being closed | Warning | CLOSE_WAIT above threshold, offending PID in `opdata` |
 | Reconnect storm | Warning | TIME_WAIT holds more than `{$WINEX.SOCK.TIMEWAIT.PCT}` % of the **discovered** port range; not a leak, and the trigger says so |
-| Handles are not returning to baseline | High | the same rule on the busiest process's handles. The only handle leak detector here |
+| Handles in one process are above the ceiling | Average | one process's 24h **floor** is above `{$WINEX.HANDLES.CEILING}`. The floor, not the last value: a process that peaks at four times its trough every day is not reported for its peaks. Average, not High — a standing high count is something to schedule a restart for, not to wake up for |
 | Nonpaged pool above the ceiling | High | above `{$WINEX.POOL.NONPAGED.PCT}` % of physical memory |
-| Paged pool is not returning to baseline | Warning | the same rule on paged pool bytes |
-| Nonpaged pool is not returning to baseline | Warning | the same rule on nonpaged pool bytes |
 | Paged pool above the ceiling | High | above `{$WINEX.POOL.PAGED.PCT}` % of physical memory |
-| Socket probe: no data | Average | **dependency root**: agent down, probe unsupported, or payload truncated |
-| Process probe: no data | Average | only the process query broke |
-| Kernel pool: no data | Average | either pool counter went missing |
-| Kernel pool ratio: no data | Average | the pool shares cannot be computed — counter, memory reading or calculation |
-| Port range probe: no data | Average | the dynamic port range stopped being measured |
+| Socket probe: no data | Warning | **dependency root**: agent down, probe unsupported, or payload truncated |
+| Process probe: no data | Warning | only the process query broke |
+| Kernel pool: no data | Warning | either pool counter went missing |
+| Kernel pool ratio: no data | Warning | the pool shares cannot be computed — counter, memory reading or calculation |
+| Port range probe: no data | Warning | the dynamic port range stopped being measured |
 
 Each collection chain — sockets, processes, kernel pool, event log — has **its own dependency root**.
 A dependency here means "the parent's failure makes this signal meaningless", not "these tend to fail
@@ -113,11 +121,29 @@ one API call, from the problem to the PID lookup.
    at the first stored value; between linking and that value every trigger in every template is
    Unknown, and this one is not special.
 
+## How alerts close
+
+The way Zabbix closes anything by default: **when the expression stops holding**. No trigger carries a
+`recovery_expression`, and that is a decision rather than an omission.
+
+A separate recovery expression is a second, independent condition. Wherever it can be true at the same
+instant as the firing condition, Zabbix opens and closes the problem in a loop. Measured on the fleet's
+own history, at the cadence each metric is actually collected at, that cost the growth detectors 57
+problems against 19. Those detectors are gone, but the rule still binds anything added here later.
+
+Ceiling triggers close when the quantity drops back below the ceiling: pool below its share of RAM, a
+process's 24-hour floor below `{$WINEX.HANDLES.CEILING}`. A process that gets restarted releases its
+alert within a day - exactly the time the new, lower value needs to push the old one out of the
+24-hour window. `manual_close` is on where closing by hand makes sense.
+
+`Windows confirms TCP port exhaustion` closes itself 30 minutes after the last log entry: it reports a
+fact, not a state.
+
 ## Macros
 
 | Macro | Default | Meaning |
 |---|---|---|
-| `{$WINEX.GROWTH.FACTOR}` | `1.05` | How far a floor must rise - the 6h floor against the 12h, and the 12h against the day. The only number in all four detectors |
+| `{$WINEX.HANDLES.CEILING}` | `100000` | Handles one process may hold before it is reported regardless of trend. Read off the 24h floor rather than the last value, so a process that peaks high and falls back every day is not reported for its peaks. Measured: the largest floor on a healthy host was a search indexer at 58000 |
 | `{$WINEX.NODATA.PERIOD}` | `15m` | Silence tolerated on a probe. Keep at ≥ 3 × `{$WINEX.PROBE.INTERVAL}` |
 | `{$WINEX.POOL.NONPAGED.PCT}` | `20` | Nonpaged pool ceiling, percent of physical memory |
 | `{$WINEX.POOL.PAGED.PCT}` | `15` | Paged pool ceiling, percent of physical memory |
@@ -142,16 +168,26 @@ any fixed count mean something different.
 
 What this template deliberately does **not** catch:
 
+- **a leak before it reaches the ceiling.** This is the main and deliberate loss. A process growing
+  1000 handles a day from a base of 12000 goes unreported for 73 days, until it crosses
+  `{$WINEX.HANDLES.CEILING}`. The growth detector that caught this was here and was removed: on a live
+  fleet it reported nine hosts out of 28 at once and reopened on three. If a particular host is worth
+  watching sooner, the answer is to lower the ceiling **on that host**, not to bring the general rule
+  back;
+- **there is no forecast for handles or pool.** `timeleft` only works where history runs deeper than
+  the forecast horizon; on three days of data two ways of computing it disagree by a factor of 20. The
+  only forecast here is on ports, where the horizon is a day. Revisit once two or three weeks have
+  accumulated: Zabbix 7.0 has `trendavg`, `timeleft`, `baselinewma` and `baselinedev`, all native;
 - **a leak spread across a hundred processes** that never moves the busiest one. The reasoning is
   that such a leak still raises the paged pool, whose ceiling is physical;
-- **only handles carry a growth figure in the alert** - `winex.handles.growth`. Sockets and pool
-  do not;
 - **`Reconnect storm` works only where the dynamic port range was discovered**, since its threshold
   is a share of `{#PORT_NUM}`. If the `MSFT_NetTCPSetting` query never answers, a separate
   `Port range probe: no data` trigger says so and the prototypes depend on it;
-- **a genuinely growing workload is indistinguishable from a leak.** The rule sees a floor that does
-  not come back down; a server that is honestly getting busier looks the same. That is the price of
-  having no thresholds.
+- **a genuinely growing workload is indistinguishable from a leak** - which is exactly why the ceiling
+  is set per host rather than derived from a trend: "too much" is decided by a person who knows what
+  the server is for;
+- **GDI and USER objects are not collected.** Their per-process limit is a hard 10000, and on terminal
+  servers that is a likelier cause of failure than kernel handles. A known gap.
 
 Adjacent subjects deliberately left out:
 
