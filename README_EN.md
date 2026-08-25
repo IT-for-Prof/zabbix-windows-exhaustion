@@ -94,8 +94,11 @@ That decision is made once, by a person, in daylight, and it is the whole calibr
 
 Each collection chain — sockets, processes, kernel pool, event log — has **its own dependency root**.
 A dependency here means "the parent's failure makes this signal meaningless", not "these tend to fail
-together": a stalled WMI query must not silence a pool alert whose data is still arriving. The price is
-three events instead of one during a total agent outage.
+together": a stalled WMI query must not silence a pool alert whose data is still arriving. Since 1.4.0 the
+roots themselves depend on the stock availability triggers, so a total agent outage collapses to one event -
+but only when the 5-minute heartbeat parent reports it. The roots fire at 15 minutes and the other parent at
+30, so an outage the heartbeat misses is unchanged: four root events at 15 minutes plus the stock one at 30.
+That was 17 of 43 outages on the fleet this was measured against.
 
 Triggers that name an offender carry a "PID to name map" link and a `pidmap_item` tag — one click, or
 one API call, from the problem to the PID lookup.

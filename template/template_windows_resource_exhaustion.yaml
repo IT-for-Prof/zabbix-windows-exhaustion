@@ -57,14 +57,19 @@ zabbix_export:
 
         Requirements:
         - Windows 8 / Server 2012 or newer (root\StandardCimv2 with MSFT_NetTCPConnection).
-        - Zabbix agent or agent 2 with the default configuration. Verified on agent 2 7.0.18 /
-          Windows Server 2025 against Zabbix 7.0.
+        - Zabbix agent or agent 2, version 7.0 or newer, with the default configuration. Verified on
+          agent 2 7.0.18 / Windows Server 2025 against Zabbix 7.0. The floor is load-bearing since 1.3.0:
+          a per-item timeout only reaches the agent for active checks from 7.0 onwards, so an older agent
+          silently applies its own Timeout instead and the socket probe dies well below the connection
+          ceiling documented below.
         - perf_counter_en, not perf_counter: on a localized Windows the non-localized key finds nothing.
         - Every item is an active check. The agent needs ServerActive pointing at the server or proxy
           and a Hostname that matches the host in Zabbix; nothing has to reach the agent on 10050.
           A ServerActive that is wrong or absent silences the whole template at once - the no-data
           triggers below are what report it.
-        - Link IN ADDITION to the stock Windows template, not instead of it.
+        - Link IN ADDITION to the stock "Windows by Zabbix agent active", not instead of it. Since 1.4.0
+          that exact template is required, not merely recommended: the no-data triggers depend on its two
+          availability triggers, and Zabbix refuses to link a template whose dependency cannot resolve.
         - The handle ceiling reads item history, not trends. It needs 24 hours of it to be fully armed
           after linking, and reports OK rather than Unknown before that. Shortening history below 24h
           on winex.handles.max disables it silently - that is the one setting to leave alone.
@@ -791,7 +796,14 @@ zabbix_export:
         (an item error, which nodata on the master would not see), or the payload was rejected as
         truncated by preprocessing.
         Since 1.4.0 it depends on the stock template's two availability triggers, which is what makes
-        one dead agent page once instead of five times. That was not possible while this template mixed
+        one dead agent page once instead of five times - when the 5-minute heartbeat parent reports the
+        outage. It does not always. These roots fire at {$WINEX.NODATA.PERIOD}, 15 minutes by default, so
+        the 5-minute parent beats them and the 30-minute one does not: on the fleet this was measured
+        against, the heartbeat stayed silent on 17 outages out of 43. In one of those the count is unchanged
+        from before the dependency existed - all four roots fire at 15 minutes, each on its own chain, and
+        the stock trigger adds a fifth at 30. Widening
+        the macro past 30 minutes would close the gap and cost 20 minutes of detection on the case these
+        triggers exist for - a WMI probe that dies while the agent stays alive. That was not possible while this template mixed
         passive and active items: the passive and active stock variants ship different availability
         triggers, a dependency names one of them, and half a fleet has each. Moving every item to active
         checks in 1.3.0 removed the fork, and the requirement it creates - the stock
@@ -813,7 +825,7 @@ zabbix_export:
       event_name: 'Process probe on {HOST.NAME} has been silent for {$WINEX.NODATA.PERIOD}'
       opdata: 'last seen: {ITEM.LASTVALUE1} handles'
       priority: WARNING
-      description: 'Root of the process chain. It has no parent on purpose: the cimv2 probe fails independently of the socket probe, and chaining them would let a stalled socket query silence a live handle leak.'
+      description: 'Root of the process chain. Since 1.4.0 it depends on the stock availability triggers, as every root here does - a dead agent stops every transport at once. What it still has no parent among is the sibling roots: the cimv2 probe fails independently of the socket probe, and chaining them would let a stalled socket query silence a live handle leak.'
       dependencies:
         - name: 'Windows: Active checks are not available'
           expression: 'min(/Windows by Zabbix agent active/zabbix[host,active_agent,available],{$AGENT.TIMEOUT})=2'
@@ -830,7 +842,7 @@ zabbix_export:
       event_name: 'Kernel pool counters on {HOST.NAME} have been silent for {$WINEX.NODATA.PERIOD}'
       opdata: 'last seen: nonpaged {ITEM.LASTVALUE1}, paged {ITEM.LASTVALUE2}'
       priority: WARNING
-      description: 'Root of the kernel-pool chain, watching the raw counters themselves. It deliberately does NOT watch the derived ratio items: those are also fed by the memory reading, and a chain must be watched at its own source or a failure somewhere else silences it. No parent, because the pool rides perf_counter_en rather than WMI - a WMI stall must not silence alerts whose data is still arriving.'
+      description: 'Root of the kernel-pool chain, watching the raw counters themselves. It deliberately does NOT watch the derived ratio items: those are also fed by the memory reading, and a chain must be watched at its own source or a failure somewhere else silences it. No sibling root as a parent, because the pool rides perf_counter_en rather than WMI - a WMI stall must not silence alerts whose data is still arriving. The stock availability triggers, which it has depended on since 1.4.0, are the one shared exception: a dead agent takes perf counters and WMI with it.'
       dependencies:
         - name: 'Windows: Active checks are not available'
           expression: 'min(/Windows by Zabbix agent active/zabbix[host,active_agent,available],{$AGENT.TIMEOUT})=2'
@@ -872,8 +884,9 @@ zabbix_export:
         cover: the headroom item hangs off the socket probe, so a failure confined to this query
         leaves the discovered range frozen at whatever it last was, and a range retuned with netsh
         would never be picked up.
-        No parent, for the same reason the other roots have none - it is a separate query and fails
-        independently.
+        No sibling root as a parent, for the same reason the others have none - it is a separate query
+        and fails independently. Like the other roots it does depend on the stock availability triggers
+        since 1.4.0, because a dead agent ends every query at once.
       dependencies:
         - name: 'Windows: Active checks are not available'
           expression: 'min(/Windows by Zabbix agent active/zabbix[host,active_agent,available],{$AGENT.TIMEOUT})=2'
