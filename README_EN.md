@@ -106,6 +106,9 @@ one API call, from the problem to the PID lookup.
   `MSFT_NetTCPConnection`.
 - Zabbix agent or agent 2, default configuration. Verified on agent 2 7.0.18 / Windows Server 2025.
 - `perf_counter_en` only — on a localized Windows the non-English key finds nothing.
+- The stock **`Windows by Zabbix agent active`** must be linked to the same host: since 1.4.0 the
+  no-data triggers depend on its two availability triggers, and Zabbix refuses to link a template
+  whose trigger dependency cannot be resolved.
 - Every item is an active check (since 1.3.0). The agent needs `ServerActive` pointing at the server
   or proxy and a `Hostname` matching the host in Zabbix; nothing has to reach the agent on 10050.
   A wrong or absent `ServerActive` silences the whole template — the no-data triggers report that, and

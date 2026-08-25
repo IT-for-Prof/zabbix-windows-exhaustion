@@ -90,7 +90,7 @@ zabbix_export:
         License: MIT (c) 2026 Konstantin Tyutyunnik
       vendor:
         name: itforprof.com
-        version: 1.3.1
+        version: 1.4.0
       groups:
         - name: Templates/Operating systems
       items:
@@ -790,10 +790,18 @@ zabbix_export:
         ways the chain can go quiet: the agent is down, the WMI probe went unsupported after a timeout
         (an item error, which nodata on the master would not see), or the payload was rejected as
         truncated by preprocessing.
-        It deliberately does not depend on the stock template's "Zabbix agent is not available":
-        a cross-template dependency would make this template unlinkable without that exact stock
-        template, and the passive and active variants are not interchangeable. Add that dependency
-        per host if you want it.
+        Since 1.4.0 it depends on the stock template's two availability triggers, which is what makes
+        one dead agent page once instead of five times. That was not possible while this template mixed
+        passive and active items: the passive and active stock variants ship different availability
+        triggers, a dependency names one of them, and half a fleet has each. Moving every item to active
+        checks in 1.3.0 removed the fork, and the requirement it creates - the stock
+        "Windows by Zabbix agent active" must be linked to the same host - is one every host running
+        these checks already meets.
+      dependencies:
+        - name: 'Windows: Active checks are not available'
+          expression: 'min(/Windows by Zabbix agent active/zabbix[host,active_agent,available],{$AGENT.TIMEOUT})=2'
+        - name: 'Windows: Zabbix agent is not available'
+          expression: 'nodata(/Windows by Zabbix agent active/agent.ping,{$AGENT.NODATA_TIMEOUT})=1'
       tags:
         - tag: component
           value: network
@@ -806,6 +814,11 @@ zabbix_export:
       opdata: 'last seen: {ITEM.LASTVALUE1} handles'
       priority: WARNING
       description: 'Root of the process chain. It has no parent on purpose: the cimv2 probe fails independently of the socket probe, and chaining them would let a stalled socket query silence a live handle leak.'
+      dependencies:
+        - name: 'Windows: Active checks are not available'
+          expression: 'min(/Windows by Zabbix agent active/zabbix[host,active_agent,available],{$AGENT.TIMEOUT})=2'
+        - name: 'Windows: Zabbix agent is not available'
+          expression: 'nodata(/Windows by Zabbix agent active/agent.ping,{$AGENT.NODATA_TIMEOUT})=1'
       tags:
         - tag: component
           value: os
@@ -818,6 +831,11 @@ zabbix_export:
       opdata: 'last seen: nonpaged {ITEM.LASTVALUE1}, paged {ITEM.LASTVALUE2}'
       priority: WARNING
       description: 'Root of the kernel-pool chain, watching the raw counters themselves. It deliberately does NOT watch the derived ratio items: those are also fed by the memory reading, and a chain must be watched at its own source or a failure somewhere else silences it. No parent, because the pool rides perf_counter_en rather than WMI - a WMI stall must not silence alerts whose data is still arriving.'
+      dependencies:
+        - name: 'Windows: Active checks are not available'
+          expression: 'min(/Windows by Zabbix agent active/zabbix[host,active_agent,available],{$AGENT.TIMEOUT})=2'
+        - name: 'Windows: Zabbix agent is not available'
+          expression: 'nodata(/Windows by Zabbix agent active/agent.ping,{$AGENT.NODATA_TIMEOUT})=1'
       tags:
         - tag: component
           value: memory
@@ -856,6 +874,11 @@ zabbix_export:
         would never be picked up.
         No parent, for the same reason the other roots have none - it is a separate query and fails
         independently.
+      dependencies:
+        - name: 'Windows: Active checks are not available'
+          expression: 'min(/Windows by Zabbix agent active/zabbix[host,active_agent,available],{$AGENT.TIMEOUT})=2'
+        - name: 'Windows: Zabbix agent is not available'
+          expression: 'nodata(/Windows by Zabbix agent active/agent.ping,{$AGENT.NODATA_TIMEOUT})=1'
       tags:
         - tag: component
           value: network
