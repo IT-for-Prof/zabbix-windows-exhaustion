@@ -106,8 +106,10 @@ one API call, from the problem to the PID lookup.
   `MSFT_NetTCPConnection`.
 - Zabbix agent or agent 2, default configuration. Verified on agent 2 7.0.18 / Windows Server 2025.
 - `perf_counter_en` only — on a localized Windows the non-English key finds nothing.
-- The server or proxy must reach the agent: everything except the event log is a passive check.
-  `eventlog[]` is active-only and silently collects nothing where active checks are not set up.
+- Every item is an active check (since 1.3.0). The agent needs `ServerActive` pointing at the server
+  or proxy and a `Hostname` matching the host in Zabbix; nothing has to reach the agent on 10050.
+  A wrong or absent `ServerActive` silences the whole template — the no-data triggers report that, and
+  the parameter itself is read by [zabbix-agent-config-guard](https://github.com/IT-for-Prof/zabbix-agent-config-guard).
 
 ## Installation
 

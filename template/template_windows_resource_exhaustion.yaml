@@ -5,8 +5,8 @@ zabbix_export:
       name: Templates/Operating systems
   templates:
     - uuid: 66dc4a2b623142faad3d97af8561ff1c
-      template: Windows resource exhaustion by Zabbix agent
-      name: Windows resource exhaustion by Zabbix agent
+      template: Windows resource exhaustion by Zabbix agent active
+      name: Windows resource exhaustion by Zabbix agent active
       description: |
         Resource exhaustion and leaks on Windows - sockets, handles, kernel pool - attributed per process.
 
@@ -60,8 +60,10 @@ zabbix_export:
         - Zabbix agent or agent 2 with the default configuration. Verified on agent 2 7.0.18 /
           Windows Server 2025 against Zabbix 7.0.
         - perf_counter_en, not perf_counter: on a localized Windows the non-localized key finds nothing.
-        - The server or proxy must reach the agent for passive checks. The event log item is the one
-          exception: eventlog[] is an active-only key and stays silent where active checks are not set up.
+        - Every item is an active check. The agent needs ServerActive pointing at the server or proxy
+          and a Hostname that matches the host in Zabbix; nothing has to reach the agent on 10050.
+          A ServerActive that is wrong or absent silences the whole template at once - the no-data
+          triggers below are what report it.
         - Link IN ADDITION to the stock Windows template, not instead of it.
         - The handle ceiling reads item history, not trends. It needs 24 hours of it to be fully armed
           after linking, and reports OK rather than Unknown before that. Shortening history below 24h
@@ -88,13 +90,14 @@ zabbix_export:
         License: MIT (c) 2026 Konstantin Tyutyunnik
       vendor:
         name: itforprof.com
-        version: 1.2.0
+        version: 1.3.1
       groups:
         - name: Templates/Operating systems
       items:
         - uuid: 865e40f31d4a4dbea7082f5a57214b24
           name: 'Sockets: WMI probe'
           key: 'wmi.getall[root\standardcimv2,"SELECT State,OwningProcess FROM MSFT_NetTCPConnection"]'
+          type: ZABBIX_ACTIVE
           delay: '{$WINEX.PROBE.INTERVAL}'
           timeout: '{$WINEX.WMI.TIMEOUT}'
           history: '0'
@@ -114,6 +117,7 @@ zabbix_export:
         - uuid: bf79fa9a74ff4e5b9ad0139a7af6c530
           name: 'Processes: WMI probe'
           key: 'wmi.getall[root\cimv2,"SELECT Name,ProcessId,HandleCount FROM Win32_Process"]'
+          type: ZABBIX_ACTIVE
           delay: '{$WINEX.PROBE.INTERVAL}'
           timeout: '{$WINEX.WMI.TIMEOUT}'
           history: '0'
@@ -304,6 +308,7 @@ zabbix_export:
         - uuid: 000174cbe5f0478e846442b30bb9460f
           name: 'Ports: dynamic range probe'
           key: 'wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]'
+          type: ZABBIX_ACTIVE
           delay: '{$WINEX.PROBE.INTERVAL}'
           timeout: '{$WINEX.WMI.TIMEOUT}'
           history: 1d
@@ -441,7 +446,8 @@ zabbix_export:
             trigger is attached to it.
             eventlog[] is an ACTIVE-ONLY key. On a host that does not run active checks this item stays
             empty for ever and is indistinguishable from a healthy one - confirm active checks are
-            configured before relying on this signal. Everything else in this template is passive.
+            configured before relying on this signal. Since 1.3.0 every other item is an active check
+            too, so that condition is no longer specific to this one.
           tags:
             - tag: component
               value: network
@@ -471,6 +477,7 @@ zabbix_export:
         - uuid: 42f710a1775f4141a66cb30c2db9931f
           name: 'Memory: physical total'
           key: 'wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"]'
+          type: ZABBIX_ACTIVE
           delay: '{$WINEX.PROBE.INTERVAL}'
           timeout: '{$WINEX.WMI.TIMEOUT}'
           value_type: FLOAT
@@ -542,6 +549,7 @@ zabbix_export:
         - uuid: 2c7d8d456e014aceb4ec45375af616c9
           name: 'Kernel pool: nonpaged'
           key: 'perf_counter_en["\Memory\Pool Nonpaged Bytes",60]'
+          type: ZABBIX_ACTIVE
           delay: 1m
           units: B
           description: |
@@ -555,6 +563,7 @@ zabbix_export:
         - uuid: d82f7c3e89d54704a9fea2808d0e1e6b
           name: 'Kernel pool: paged'
           key: 'perf_counter_en["\Memory\Pool Paged Bytes",60]'
+          type: ZABBIX_ACTIVE
           delay: 1m
           units: B
           description: 'The averaging parameter 60 is carried for symmetry with the nonpaged counter, where it is mandatory to avoid a key collision with the stock Windows template.'
@@ -638,7 +647,7 @@ zabbix_export:
                   value: capacity
           trigger_prototypes:
             - uuid: 9e79a5dfca644a16908b949aead20f6e
-              expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.time_wait,{$WINEX.NODATA.PERIOD})=0 and nodata(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.sock.time_wait,10m)>{#PORT_NUM}*{$WINEX.SOCK.TIMEWAIT.PCT}/100 and last(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}])>=0'
+              expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.sock.time_wait,{$WINEX.NODATA.PERIOD})=0 and nodata(/Windows resource exhaustion by Zabbix agent active/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent active/winex.sock.time_wait,10m)>{#PORT_NUM}*{$WINEX.SOCK.TIMEWAIT.PCT}/100 and last(/Windows resource exhaustion by Zabbix agent active/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}])>=0'
               name: 'Reconnect storm'
               event_name: '{ITEM.LASTVALUE1} sockets in TIME_WAIT on {HOST.NAME}, {$WINEX.SOCK.TIMEWAIT.PCT}% of its {#PORT_NUM}-port range'
               priority: WARNING
@@ -655,16 +664,16 @@ zabbix_export:
                 process and Windows reports OwningProcess 0 for all of them.
               dependencies:
                 - name: 'Port range probe: no data'
-                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1 and length(last(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]))>=0'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1 and length(last(/Windows resource exhaustion by Zabbix agent active/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]))>=0'
                 - name: 'Socket probe: no data'
-                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent/winex.sock.total)>=0'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.sock.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent active/winex.sock.total)>=0'
               tags:
                 - tag: component
                   value: network
                 - tag: scope
                   value: capacity
             - uuid: a6ae81f9181b48a294c5cb0c679f1681
-              expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and max(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],15m)<{#PORT_NUM}*{$WINEX.PORTS.FREE.PCT}/100 and length(last(/Windows resource exhaustion by Zabbix agent/winex.sock.bound.top))>0'
+              expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and max(/Windows resource exhaustion by Zabbix agent active/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],15m)<{#PORT_NUM}*{$WINEX.PORTS.FREE.PCT}/100 and length(last(/Windows resource exhaustion by Zabbix agent active/winex.sock.bound.top))>0'
               name: 'Dynamic port range is running out'
               event_name: 'Only {ITEM.LASTVALUE1} of {#PORT_NUM} dynamic ports left on {HOST.NAME}'
               opdata: 'holding Bound: {{ITEM.LASTVALUE3}.regsub("(.*)", \1)}'
@@ -672,9 +681,9 @@ zabbix_export:
               description: 'The threshold is a share of the measured range rather than a fixed count, because widening the range changes what any fixed number means. Widening with netsh buys time and survives a reboot, but it postpones the failure rather than fixing it - the process to look at is in the operational data.'
               dependencies:
                 - name: 'Port range probe: no data'
-                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1 and length(last(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]))>=0'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1 and length(last(/Windows resource exhaustion by Zabbix agent active/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]))>=0'
                 - name: 'Socket probe: no data'
-                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent/winex.sock.total)>=0'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.sock.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent active/winex.sock.total)>=0'
               url_name: 'PID to name map'
               url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
               tags:
@@ -685,7 +694,7 @@ zabbix_export:
                 - tag: scope
                   value: capacity
             - uuid: 7565bd6f93354ef5808c73032cbfc289
-              expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,{$WINEX.NODATA.PERIOD})=0 and nodata(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.sock.bound,1h)>{$WINEX.SOCK.BOUND.FLOOR} and timeleft(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],6h,0)<{$WINEX.PORTS.TIMELEFT}'
+              expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.sock.bound,{$WINEX.NODATA.PERIOD})=0 and nodata(/Windows resource exhaustion by Zabbix agent active/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent active/winex.sock.bound,1h)>{$WINEX.SOCK.BOUND.FLOOR} and timeleft(/Windows resource exhaustion by Zabbix agent active/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],6h,0)<{$WINEX.PORTS.TIMELEFT}'
               name: 'Dynamic port range will run out'
               event_name: 'Dynamic ports on {HOST.NAME} run out in under {$WINEX.PORTS.TIMELEFT} at the current rate'
               opdata: 'Bound now {ITEM.LASTVALUE1}, free {ITEM.LASTVALUE2}'
@@ -698,9 +707,9 @@ zabbix_export:
                 accumulating, timeleft() returns effectively infinity and this stays quiet.
               dependencies:
                 - name: 'Port range probe: no data'
-                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1 and length(last(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]))>=0'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1 and length(last(/Windows resource exhaustion by Zabbix agent active/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]))>=0'
                 - name: 'Dynamic port range is running out'
-                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and max(/Windows resource exhaustion by Zabbix agent/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],15m)<{#PORT_NUM}*{$WINEX.PORTS.FREE.PCT}/100 and length(last(/Windows resource exhaustion by Zabbix agent/winex.sock.bound.top))>0'
+                  expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],{$WINEX.NODATA.PERIOD})=0 and max(/Windows resource exhaustion by Zabbix agent active/winex.ports.eph.free[{#PORT_START},{#PORT_NUM}],15m)<{#PORT_NUM}*{$WINEX.PORTS.FREE.PCT}/100 and length(last(/Windows resource exhaustion by Zabbix agent active/winex.sock.bound.top))>0'
               url_name: 'PID to name map'
               url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
               tags:
@@ -717,12 +726,12 @@ zabbix_export:
                 - sortorder: '0'
                   color: 1A7C11
                   item:
-                    host: Windows resource exhaustion by Zabbix agent
+                    host: Windows resource exhaustion by Zabbix agent active
                     key: 'winex.ports.eph.free[{#PORT_START},{#PORT_NUM}]'
                 - sortorder: '1'
                   color: F63100
                   item:
-                    host: Windows resource exhaustion by Zabbix agent
+                    host: Windows resource exhaustion by Zabbix agent active
                     key: winex.sock.bound.max
       tags:
         - tag: class
@@ -767,7 +776,7 @@ zabbix_export:
           description: 'Timeout of the WMI probes. Raise it before raising the polling interval.'
   triggers:
     - uuid: ce84ff442dff481eadf155ef88310bcb
-      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent/winex.sock.total)>=0'
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.sock.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent active/winex.sock.total)>=0'
       name: 'Socket probe: no data'
       event_name: 'Socket probe on {HOST.NAME} has been silent for {$WINEX.NODATA.PERIOD}'
       opdata: 'last seen: {ITEM.LASTVALUE1} sockets'
@@ -791,7 +800,7 @@ zabbix_export:
         - tag: scope
           value: availability
     - uuid: d6ee90082baa4011baa0f57624b46713
-      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.handles.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent/winex.handles.total)>=0'
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.handles.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent active/winex.handles.total)>=0'
       name: 'Process probe: no data'
       event_name: 'Process probe on {HOST.NAME} has been silent for {$WINEX.NODATA.PERIOD}'
       opdata: 'last seen: {ITEM.LASTVALUE1} handles'
@@ -803,7 +812,7 @@ zabbix_export:
         - tag: scope
           value: availability
     - uuid: ae13b0bc20df4b459613f94a41566ca2
-      expression: '(nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])>=0 and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60])>=0'
+      expression: '(nodata(/Windows resource exhaustion by Zabbix agent active/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent active/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent active/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])>=0 and last(/Windows resource exhaustion by Zabbix agent active/perf_counter_en["\Memory\Pool Paged Bytes",60])>=0'
       name: 'Kernel pool: no data'
       event_name: 'Kernel pool counters on {HOST.NAME} have been silent for {$WINEX.NODATA.PERIOD}'
       opdata: 'last seen: nonpaged {ITEM.LASTVALUE1}, paged {ITEM.LASTVALUE2}'
@@ -815,7 +824,7 @@ zabbix_export:
         - tag: scope
           value: availability
     - uuid: 83257a589f9843d088f75fa5150bfabf
-      expression: '(nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"])>=0'
+      expression: '(nodata(/Windows resource exhaustion by Zabbix agent active/winex.pool.nonpaged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent active/winex.pool.paged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent active/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent active/winex.pool.nonpaged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent active/winex.pool.paged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent active/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"])>=0'
       name: 'Kernel pool ratio: no data'
       event_name: 'Kernel pool ratios on {HOST.NAME} cannot be computed'
       opdata: 'last seen: nonpaged {ITEM.LASTVALUE1} of RAM, paged {ITEM.LASTVALUE2} of RAM'
@@ -828,14 +837,14 @@ zabbix_export:
         fire, and the counter failure is the one worth reading.
       dependencies:
         - name: 'Kernel pool: no data'
-          expression: '(nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])>=0 and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60])>=0'
+          expression: '(nodata(/Windows resource exhaustion by Zabbix agent active/perf_counter_en["\Memory\Pool Nonpaged Bytes",60],{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent active/perf_counter_en["\Memory\Pool Paged Bytes",60],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent active/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])>=0 and last(/Windows resource exhaustion by Zabbix agent active/perf_counter_en["\Memory\Pool Paged Bytes",60])>=0'
       tags:
         - tag: component
           value: memory
         - tag: scope
           value: availability
     - uuid: 67e59281c9d84fca9138afdc78ad4f9b
-      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1 and length(last(/Windows resource exhaustion by Zabbix agent/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]))>=0'
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"],{$WINEX.NODATA.PERIOD})=1 and length(last(/Windows resource exhaustion by Zabbix agent active/wmi.getall[root\standardcimv2,"SELECT DynamicPortRangeStartPort,DynamicPortRangeNumberOfPorts FROM MSFT_NetTCPSetting WHERE SettingName=''Internet''"]))>=0'
       name: 'Port range probe: no data'
       event_name: 'Dynamic port range on {HOST.NAME} has not been measured for {$WINEX.NODATA.PERIOD}'
       opdata: 'range last seen: {{ITEM.LASTVALUE1}.regsub("StartPort[^0-9]+([0-9]+)", \1)} + {{ITEM.LASTVALUE1}.regsub("NumberOfPorts[^0-9]+([0-9]+)", \1)} ports'
@@ -853,9 +862,9 @@ zabbix_export:
         - tag: scope
           value: availability
     - uuid: fc3c401634b0424c8d137538b54a4fa4
-      expression: 'count(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^4227$,,skip],30m)>0'
+      expression: 'count(/Windows resource exhaustion by Zabbix agent active/eventlog[System,,,,^4227$,,skip],30m)>0'
       recovery_mode: RECOVERY_EXPRESSION
-      recovery_expression: 'nodata(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^4227$,,skip],1h)=1'
+      recovery_expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/eventlog[System,,,,^4227$,,skip],1h)=1'
       name: 'Windows confirms the dynamic port range is exhausted'
       event_name: 'Windows on {HOST.NAME} could not allocate an ephemeral port (event 4227)'
       priority: HIGH
@@ -865,8 +874,10 @@ zabbix_export:
         process. It earns its place by being the only port signal that does not depend on the
         macro-declared range being correct, so it still fires when the headroom arithmetic is wrong.
         High because the host is out of ports right now and new outbound connections are failing.
-        No parent trigger: it rides the active-check transport, which fails independently of the
-        passive WMI probes. Recovery is time-based because count() alone would latch this trigger in
+        No parent trigger, but the reason narrowed in 1.3.0: this item used to ride a transport
+        independent of the WMI probes, and now shares it. What is left is that an event-log trigger
+        cannot have a no-data parent at all - a healthy host produces nothing here, so silence is the
+        normal state. Recovery is time-based because count() alone would latch this trigger in
         PROBLEM for ever - an event-log item produces values only during an incident.
       url_name: 'PID to name map'
       url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
@@ -878,9 +889,9 @@ zabbix_export:
         - tag: scope
           value: capacity
     - uuid: 1c0ea932ec8442f6aac7638ee1d34c2f
-      expression: 'count(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^4231$,,skip],30m)>0'
+      expression: 'count(/Windows resource exhaustion by Zabbix agent active/eventlog[System,,,,^4231$,,skip],30m)>0'
       recovery_mode: RECOVERY_EXPRESSION
-      recovery_expression: 'nodata(/Windows resource exhaustion by Zabbix agent/eventlog[System,,,,^4231$,,skip],1h)=1'
+      recovery_expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/eventlog[System,,,,^4231$,,skip],1h)=1'
       name: 'Local endpoint reused faster than TIME_WAIT drains'
       event_name: 'Windows on {HOST.NAME} rejected an outbound connection reusing a recent 4-tuple (event 4231)'
       priority: WARNING
@@ -904,7 +915,7 @@ zabbix_export:
         - tag: scope
           value: capacity
     - uuid: 361ed86a3ddd49ae907871108c4fcc62
-      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.close_wait,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.sock.close_wait,15m)>{$WINEX.SOCK.CLOSEWAIT.MAX} and length(last(/Windows resource exhaustion by Zabbix agent/winex.sock.close_wait.top))>0'
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.sock.close_wait,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent active/winex.sock.close_wait,15m)>{$WINEX.SOCK.CLOSEWAIT.MAX} and length(last(/Windows resource exhaustion by Zabbix agent active/winex.sock.close_wait.top))>0'
       name: 'Connections are not being closed'
       event_name: '{ITEM.LASTVALUE1} sockets stuck in CLOSE_WAIT on {HOST.NAME}'
       opdata: 'top: {{ITEM.LASTVALUE3}.regsub("(.*)", \1)}'
@@ -912,7 +923,7 @@ zabbix_export:
       description: 'CLOSE_WAIT piles up when the local application never calls close() on a socket the peer already closed. An application bug rather than a network one; the operational data names the PID.'
       dependencies:
         - name: 'Socket probe: no data'
-          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.sock.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent/winex.sock.total)>=0'
+          expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.sock.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent active/winex.sock.total)>=0'
       url_name: 'PID to name map'
       url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=PID+to+name&filter_set=1'
       tags:
@@ -923,7 +934,7 @@ zabbix_export:
         - tag: scope
           value: capacity
     - uuid: 4a9d61c0f7b84e2ea3d5b8091c6e7f34
-      expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.handles.max,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent/winex.handles.max,24h)>{$WINEX.HANDLES.CEILING} and length(last(/Windows resource exhaustion by Zabbix agent/winex.handles.top))>0'
+      expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.handles.max,{$WINEX.NODATA.PERIOD})=0 and min(/Windows resource exhaustion by Zabbix agent active/winex.handles.max,24h)>{$WINEX.HANDLES.CEILING} and length(last(/Windows resource exhaustion by Zabbix agent active/winex.handles.top))>0'
       name: 'Handles in one process are above the ceiling'
       event_name: '{{ITEM.LASTVALUE3}.regsub("^([^=,]+)", \1)} on {HOST.NAME} holds {ITEM.LASTVALUE1} handles'
       opdata: 'top: {{ITEM.LASTVALUE3}.regsub("(.*)", \1)}'
@@ -956,7 +967,7 @@ zabbix_export:
         in daylight, and it is the whole calibration this detector needs.
       dependencies:
         - name: 'Process probe: no data'
-          expression: 'nodata(/Windows resource exhaustion by Zabbix agent/winex.handles.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent/winex.handles.total)>=0'
+          expression: 'nodata(/Windows resource exhaustion by Zabbix agent active/winex.handles.total,{$WINEX.NODATA.PERIOD})=1 and last(/Windows resource exhaustion by Zabbix agent active/winex.handles.total)>=0'
       tags:
         - tag: process
           value: '{{ITEM.VALUE3}.regsub("^([^=,]+)", \1)}'
@@ -965,7 +976,7 @@ zabbix_export:
         - tag: scope
           value: capacity
     - uuid: 8b30fefdb48241e5a3f71075bcfa8c7b
-      expression: 'min(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct,10m)>{$WINEX.POOL.NONPAGED.PCT} and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])>=0'
+      expression: 'min(/Windows resource exhaustion by Zabbix agent active/winex.pool.nonpaged.pct,10m)>{$WINEX.POOL.NONPAGED.PCT} and last(/Windows resource exhaustion by Zabbix agent active/perf_counter_en["\Memory\Pool Nonpaged Bytes",60])>=0'
       name: 'Nonpaged pool above the ceiling'
       event_name: 'Nonpaged pool on {HOST.NAME} is {ITEM.LASTVALUE1} of RAM'
       opdata: 'nonpaged pool now: {ITEM.LASTVALUE2}'
@@ -978,7 +989,7 @@ zabbix_export:
         Nonpaged pool exhaustion takes the whole machine down rather than one process.
       dependencies:
         - name: 'Kernel pool ratio: no data'
-          expression: '(nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"])>=0'
+          expression: '(nodata(/Windows resource exhaustion by Zabbix agent active/winex.pool.nonpaged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent active/winex.pool.paged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent active/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent active/winex.pool.nonpaged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent active/winex.pool.paged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent active/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"])>=0'
       tags:
         - tag: bytes_item
           value: 'perf_counter_en["\Memory\Pool Nonpaged Bytes",60]'
@@ -987,7 +998,7 @@ zabbix_export:
         - tag: scope
           value: capacity
     - uuid: 6b5869e9585f49a18ac50c4531299b4b
-      expression: 'min(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct,10m)>{$WINEX.POOL.PAGED.PCT} and last(/Windows resource exhaustion by Zabbix agent/perf_counter_en["\Memory\Pool Paged Bytes",60])>=0'
+      expression: 'min(/Windows resource exhaustion by Zabbix agent active/winex.pool.paged.pct,10m)>{$WINEX.POOL.PAGED.PCT} and last(/Windows resource exhaustion by Zabbix agent active/perf_counter_en["\Memory\Pool Paged Bytes",60])>=0'
       name: 'Paged pool above the ceiling'
       event_name: 'Paged pool on {HOST.NAME} is {ITEM.LASTVALUE1} of RAM'
       opdata: 'paged pool now: {ITEM.LASTVALUE2}'
@@ -995,7 +1006,7 @@ zabbix_export:
       description: 'Paged pool exhaustion shows up as failures to create handles, registry keys and desktop heaps rather than as a hang. Expressed as a share of memory for the same reason as the nonpaged ceiling; paged pool varies far more between roles, so the default is correspondingly looser.'
       dependencies:
         - name: 'Kernel pool ratio: no data'
-          expression: '(nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent/winex.pool.nonpaged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent/winex.pool.paged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"])>=0'
+          expression: '(nodata(/Windows resource exhaustion by Zabbix agent active/winex.pool.nonpaged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent active/winex.pool.paged.pct,{$WINEX.NODATA.PERIOD})=1 or nodata(/Windows resource exhaustion by Zabbix agent active/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"],{$WINEX.NODATA.PERIOD})=1) and last(/Windows resource exhaustion by Zabbix agent active/winex.pool.nonpaged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent active/winex.pool.paged.pct)>=0 and last(/Windows resource exhaustion by Zabbix agent active/wmi.get[root\cimv2,"SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"])>=0'
       tags:
         - tag: bytes_item
           value: 'perf_counter_en["\Memory\Pool Paged Bytes",60]'
@@ -1010,32 +1021,32 @@ zabbix_export:
         - sortorder: '0'
           color: 1A7C11
           item:
-            host: Windows resource exhaustion by Zabbix agent
+            host: Windows resource exhaustion by Zabbix agent active
             key: winex.sock.bound
         - sortorder: '1'
           color: 2774A4
           item:
-            host: Windows resource exhaustion by Zabbix agent
+            host: Windows resource exhaustion by Zabbix agent active
             key: winex.sock.established
         - sortorder: '2'
           color: F63100
           item:
-            host: Windows resource exhaustion by Zabbix agent
+            host: Windows resource exhaustion by Zabbix agent active
             key: winex.sock.close_wait
         - sortorder: '3'
           color: A54F10
           item:
-            host: Windows resource exhaustion by Zabbix agent
+            host: Windows resource exhaustion by Zabbix agent active
             key: winex.sock.time_wait
         - sortorder: '4'
           color: 6C59DC
           item:
-            host: Windows resource exhaustion by Zabbix agent
+            host: Windows resource exhaustion by Zabbix agent active
             key: winex.sock.total
         - sortorder: '5'
           color: BB2222
           item:
-            host: Windows resource exhaustion by Zabbix agent
+            host: Windows resource exhaustion by Zabbix agent active
             key: winex.sock.bound.max
     - uuid: f7ab0bcab95246ba83ae655fc8f3392b
       name: 'Windows exhaustion: handles and kernel pool'
@@ -1043,22 +1054,22 @@ zabbix_export:
         - sortorder: '0'
           color: 1A7C11
           item:
-            host: Windows resource exhaustion by Zabbix agent
+            host: Windows resource exhaustion by Zabbix agent active
             key: winex.handles.total
         - sortorder: '1'
           color: 2774A4
           item:
-            host: Windows resource exhaustion by Zabbix agent
+            host: Windows resource exhaustion by Zabbix agent active
             key: winex.handles.max
         - sortorder: '2'
           color: F63100
           yaxisside: RIGHT
           item:
-            host: Windows resource exhaustion by Zabbix agent
+            host: Windows resource exhaustion by Zabbix agent active
             key: 'perf_counter_en["\Memory\Pool Nonpaged Bytes",60]'
         - sortorder: '3'
           color: A54F10
           yaxisside: RIGHT
           item:
-            host: Windows resource exhaustion by Zabbix agent
+            host: Windows resource exhaustion by Zabbix agent active
             key: 'perf_counter_en["\Memory\Pool Paged Bytes",60]'
