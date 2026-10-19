@@ -1,215 +1,170 @@
 # Zabbix Windows resource exhaustion
 
-> Universal Zabbix 7.0 template: Windows resource exhaustion and leaks — sockets, handles, kernel pool —
-> **attributed per process**.
+> Zabbix 7.0 template: resource exhaustion on Windows - sockets, handles, kernel pool - attributed per process.
 
-Answers the question "who on this machine is leaking, and what is running out". Not tied to SQL,
-to any application, or to any server role. Stock agent keys only: `wmi.getall`, `wmi.get`,
-`perf_counter_en`, `eventlog`. **No agent configuration changes**, no third-party tools.
+The template shows which process on a machine is using up what. It is not tied to a product or a server
+role and uses stock agent keys only: `wmi.getall`, `wmi.get`, `perf_counter_en`, `eventlog`. The agent
+configuration stays as it is.
 
-[Русская версия → README.md](README.md)
+This file describes the English template, `template/template_windows_resource_exhaustion_en.yaml`. The
+Russian version of the same template is `template/template_windows_resource_exhaustion.yaml`, described in
+[README.md](README.md). Both files share UUIDs and the template name, so importing either one updates the
+installed template in place and keeps its history. A server runs one of the two.
 
 **Author:** Konstantin Tyutyunnik · [itforprof.com](https://itforprof.com) · MIT
 
 ## Why
 
-The stock Windows templates (`Windows by Zabbix agent` / `... active`) collect **no** socket, handle,
-paged-pool or per-process metric at all — only `proc.num[]` and `\System\Threads` as totals. That
-leaves three common Windows server failures invisible until the machine is already down:
+The stock Windows templates (`Windows by Zabbix agent` and `... active`) collect nothing about sockets,
+handles or paged pool, and nothing per process. Three common Windows server failures therefore stay
+invisible until the server fails:
 
-- **dynamic port range exhaustion** — the server is healthy but applications can no longer connect.
-  The process responsible is identified only by the **Bound** socket state, which neither `netstat`
-  without `-q` nor `net.tcp.socket.count` reports;
-- **a handle leak in one process** — grows over hours, visible only per process;
-- **nonpaged pool growth** — the counter is usually collected, but no stock template has a trigger
-  on it.
+- **the dynamic port range runs out.** The server is up, but applications cannot connect. The culprit
+  shows only in the Bound socket state, which neither `netstat` without `-q` nor `net.tcp.socket.count`
+  reports;
+- **one process accumulates handles.** Visible only per process;
+- **nonpaged pool grows.** The counter is usually collected, but no stock template has a trigger on it.
 
-The diagnostic this template automates is the canonical one: Microsoft's TCP port exhaustion guidance
-prescribes `netstat -anobq` and finding the process with the most **BOUND** entries. Here that runs
-continuously and ahead of time, rather than after the fact from events 4227/4231.
+Microsoft's guide to TCP port exhaustion says to run `netstat -anobq` and find the process with the most
+BOUND entries. The template does this continuously.
 
-## What it collects
+## What is collected
 
-24 items per host plus one discovery rule. Two actual WMI queries every five minutes, masters with
-`history: 0` — the raw JSON is never stored, and everything else is derived from a single parse by
-dependent items.
+24 items per host and one discovery rule. Four WMI queries run every five minutes: sockets, processes,
+port range and physical memory. The raw socket and process tables are not stored; everything else is
+computed by dependent items from one parse.
 
 | Area | Metrics |
 |---|---|
-| **Sockets** | total, established, CLOSE_WAIT, TIME_WAIT, **Bound** from `MSFT_NetTCPConnection` |
-| **Who holds them** | top 5 processes by Bound and by CLOSE_WAIT, formatted for trigger `opdata` |
-| **Dynamic ports** | free headroom. The range is **discovered** from `MSFT_NetTCPSetting`, never declared as a macro |
-| **Handles** | total, per-process maximum, top 5 as `name (PID)=count` |
-| **Kernel pool** | nonpaged and paged, in bytes and as a **share of physical memory** |
-| **Windows events** | 4227 — the system stating outright that ports ran out; 4231 — 4-tuple reuse, which is not that |
-| **Reference** | a `PID=name` map sorted by PID, to decode socket alerts |
+| Sockets | total, established, CLOSE_WAIT, TIME_WAIT, Bound - from `MSFT_NetTCPConnection` |
+| Who holds them | the five processes with the most Bound and CLOSE_WAIT sockets, ready for operational data |
+| Dynamic ports | free ports. The range is discovered from `MSFT_NetTCPSetting` |
+| Handles | total, busiest process, top five as `name (PID n)=count` |
+| Kernel pool | nonpaged and paged, in bytes and as a share of physical memory |
+| Windows events | 4231 - no ephemeral port left; 4227 - local endpoint reused too fast |
+| PID to name map | `PID=name` sorted by PID, to decode PIDs in socket alerts |
 
-Plus three graphs: sockets by state, handles and pool, and port headroom against the discovered range.
+Three graphs: sockets by state, handles and kernel pool, free ports in the discovered range.
 
-The dynamic port range is the one quantity that is **measured rather than declared**. A discovery
-rule carries its start and size straight into the headroom item and its triggers, so there is
-nothing to keep in sync and nothing that can diverge: after `netsh int ipv4 set dynamicport tcp`
-everything recomputes itself. The price is known — Zabbix requires a prototype key to contain a
-discovery macro, so retuning the range replaces the item rather than updating it and its history
-restarts: the absolute trigger recovers within its own window, the forecast needs six hours again.
+The template measures the port range itself. The discovery rule passes the start and size of the range to
+the free-port item and its triggers, so nothing needs editing after `netsh int ipv4 set dynamicport tcp`.
+Zabbix requires a discovery macro in a prototype key, so a new range creates a new item: its history starts
+over and the forecast needs six hours of data again.
 
-## What it alerts on
+## Triggers
 
-One principle: **an alert must name a limit.** Not "is it climbing" but "how far is this from the
-thing it runs out of". The difference is not philosophical: across 28 mixed Windows servers the growth
-detectors - there were four of them here - reported nine hosts at once, three of them reopening twice
-within two hours, while the nearest resource anywhere on the fleet was thirty-five days from any
-limit. Handles occupied 2.5% of their hard limit, ports 1.4% of the range, nonpaged pool 4.9% of RAM.
-Growth on a resource with 97% headroom is a graph, not an alert, and no threshold turns it into one.
+Every trigger is tied to the limit of a resource. There are no growth detectors: on 28 servers they
+reported nine hosts at once while the nearest resource was 35 days from its limit. Handles then used 2.5%
+of the per-process limit, ports 1.4% of the range, nonpaged pool 4.9% of RAM.
 
-The growth detectors were therefore removed outright, leaving three kinds of condition:
-
-- **a ceiling** — a share of a physical limit: kernel pool against RAM, port headroom against the
-  discovered range, one process's handles against `{$WINEX.HANDLES.CEILING}`;
-- **a forecast** — `timeleft` to port exhaustion, the one place here where running out is real and fast;
-- **a fact** — Windows itself logged 4227/4231; the failure already happened.
-
-The handle ceiling is the only number here not derived from physics: the per-process limit is
-16777216 and nothing reaches it, kernel memory bounds the machine first. The fleet spread is 1722 to
-487426 handles for the busiest process, a factor of 283, so one default is not right everywhere.
-Where a host legitimately runs a large holder, override `{$WINEX.HANDLES.CEILING}` **on that host**.
-That decision is made once, by a person, in daylight, and it is the whole calibration this needs.
-
-| Trigger | Severity | Logic |
+| Trigger | Severity | Fires when |
 |---|---|---|
-| Windows confirms the dynamic port range is exhausted | High | event 4227 — no ports left in the range, outbound connections are failing now |
-| Local endpoint reused faster than TIME_WAIT drains | Warning | event 4231 — 4-tuple reuse. The range is nearly empty when it fires; the fix is in the application, not a wider range |
-| Dynamic port range is running out | High | free ports below `{$WINEX.PORTS.FREE.PCT}` % of the discovered range |
-| Dynamic port range will run out | Warning | `timeleft` on port headroom < `{$WINEX.PORTS.TIMELEFT}` |
-| Connections are not being closed | Warning | CLOSE_WAIT above threshold, offending PID in `opdata` |
-| Reconnect storm | Warning | TIME_WAIT holds more than `{$WINEX.SOCK.TIMEWAIT.PCT}` % of the **discovered** port range; not a leak, and the trigger says so |
-| Handles in one process are above the ceiling | Average | one process's 24h **floor** is above `{$WINEX.HANDLES.CEILING}`. The floor, not the last value: a process that peaks at four times its trough every day is not reported for its peaks. Average, not High — a standing high count is something to schedule a restart for, not to wake up for |
-| Nonpaged pool above the ceiling | High | above `{$WINEX.POOL.NONPAGED.PCT}` % of physical memory |
-| Paged pool above the ceiling | High | above `{$WINEX.POOL.PAGED.PCT}` % of physical memory |
-| Socket probe: no data | Warning | **dependency root**: agent down, probe unsupported, or payload truncated |
-| Process probe: no data | Warning | only the process query broke |
-| Kernel pool: no data | Warning | either pool counter went missing |
-| Kernel pool ratio: no data | Warning | the pool shares cannot be computed — counter, memory reading or calculation |
-| Port range probe: no data | Warning | the dynamic port range stopped being measured |
+| Windows confirms the dynamic port range is exhausted | High | event 4231: no free port, outbound connections fail |
+| Local endpoint reused faster than TIME_WAIT drains | Warning | event 4227: one application reconnects to one address too often. Widening the range does not help |
+| Dynamic port range is running out | High | free ports below `{$WINEX.PORTS.FREE.PCT}`% of the discovered range |
+| Dynamic port range will run out | Warning | the `timeleft` forecast on free ports is under `{$WINEX.PORTS.TIMELEFT}` |
+| Connections are not being closed | Warning | CLOSE_WAIT sockets above the threshold for 15 minutes; the PID is in the operational data |
+| Reconnect storm | Warning | TIME_WAIT sockets hold more than `{$WINEX.SOCK.TIMEWAIT.PCT}`% of the discovered range |
+| Handles in one process are above the ceiling | Average | the busiest process's 24-hour minimum is above `{$WINEX.HANDLES.CEILING}`. Average: a standing count calls for a planned restart |
+| Nonpaged pool above the ceiling | High | above `{$WINEX.POOL.NONPAGED.PCT}`% of physical memory |
+| Paged pool above the ceiling | High | above `{$WINEX.POOL.PAGED.PCT}`% of physical memory |
+| Socket probe: no data | Warning | the socket probe is silent while the agent is alive |
+| Process probe: no data | Warning | the process probe is silent while the agent is alive |
+| Kernel pool: no data | Warning | the pool counters are silent while WMI answers |
+| Kernel pool ratio: no data | Warning | the pool ratios or the memory reading cannot be computed while the agent is alive |
+| Port range probe: no data | Warning | the port range probe is silent while the agent is alive |
 
-Each collection chain — sockets, processes, kernel pool, event log — has **its own dependency root**.
-A dependency here means "the parent's failure makes this signal meaningless", not "these tend to fail
-together": a stalled WMI query must not silence a pool alert whose data is still arriving. Since 1.4.0 the
-roots themselves depend on the stock availability triggers, so a total agent outage collapses to one event -
-but only when the 5-minute heartbeat parent reports it. The roots fire at 15 minutes and the other parent at
-30, so an outage the heartbeat misses is unchanged: four root events at 15 minutes plus the stock one at 30.
-That was 17 of 43 outages on the fleet this was measured against.
+The no-data triggers fire only while the agent keeps sending the kernel pool counter, a 1-minute check
+that does not use WMI. The counter must have arrived within the last 5 minutes and also one probe interval
+earlier. The second check prevents false firings after a reboot, when the counter is back and the probe is
+not yet. When the agent, proxy or link is down, the counter stops too and these triggers stay quiet; the
+stock template reports that case. A replay over 31 days on 38 hosts gave two firings, both a real WMI
+stall.
 
-Triggers that name an offender carry a "PID to name map" link and a `pidmap_item` tag — one click, or
-one API call, from the problem to the PID lookup.
+"Kernel pool: no data" cannot check the agent with its own counter, so it uses the WMI memory reading.
+
+Each probe has its own no-data trigger, and child triggers depend only on it, so a stalled socket query
+does not hide pool alerts whose data still arrives. While a probe is silent its child triggers keep their
+state, and an open problem stays open.
+
+Triggers that name a PID carry a "PID to name map" link in the problem.
 
 ## Requirements
 
-- Windows 8 / Server 2012 or newer — earlier releases have no `root\StandardCimv2` with
-  `MSFT_NetTCPConnection`.
-- Zabbix agent or agent 2, default configuration. Verified on agent 2 7.0.18 / Windows Server 2025.
-- `perf_counter_en` only — on a localized Windows the non-English key finds nothing.
-- The stock **`Windows by Zabbix agent active`** must be linked to the same host: since 1.4.0 the
-  no-data triggers depend on its two availability triggers, and Zabbix refuses to link a template
-  whose trigger dependency cannot be resolved.
-- Every item is an active check (since 1.3.0). The agent needs `ServerActive` pointing at the server
-  or proxy and a `Hostname` matching the host in Zabbix; nothing has to reach the agent on 10050.
-  A wrong or absent `ServerActive` silences the whole template — the no-data triggers report that, and
-  the parameter itself is read by [zabbix-agent-config-guard](https://github.com/IT-for-Prof/zabbix-agent-config-guard).
+- Windows 8 / Server 2012 or newer: older versions lack `root\StandardCimv2` with `MSFT_NetTCPConnection`.
+- Zabbix agent or agent 2, 7.0 or newer, default configuration. Verified on agent 2 7.0.18 and Windows
+  Server 2025. Agents older than 7.0 ignore the per-item timeout of an active check.
+- `perf_counter_en`, not `perf_counter`: on a localized Windows the non-localized key finds nothing.
+- Every item is an active check. The agent needs `ServerActive` pointing at the server or proxy and a
+  `Hostname` matching the host in Zabbix. Port 10050 on the agent is not used.
+- Link the stock **`Windows by Zabbix agent active`** to the same host. It is the only template that
+  reports a dead agent or a wrong `ServerActive`.
+  [zabbix-agent-config-guard](https://github.com/IT-for-Prof/zabbix-agent-config-guard) checks the
+  setting itself.
 
 ## Installation
 
-1. Import `template/template_windows_resource_exhaustion.yaml`
-   (`Data collection → Templates → Import`, `Create new` + `Update existing`, `Delete missing` off).
-2. Link it to Windows hosts **in addition** to the stock template, not instead of it.
-3. Walk the hosts where `Handles in one process are above the ceiling` fired and decide once, per
-   host: legitimately large holder, or finding. If legitimate, override `{$WINEX.HANDLES.CEILING}` on
-   the host. That is the only threshold that may ever need an override: ports and pool are shares of
-   what the host reports about itself — the discovered port range and measured memory — while a handle
-   count has no denominator anywhere in Windows. The norm belongs to the process name, not the host:
-   `dns.exe` holds 10 400 on every controller, a healthy `lsass.exe` holds 2 000–2 500, `searchd`
-   legitimately holds 40 000–58 000. No formula covers all of them: a share of the 16 777 216
-   per-process cap sits four orders of magnitude above anything observed, and comparing a host with
-   itself fires on a fifty-handle move.
-   The handle ceiling reaches full sensitivity a day after linking, when the 24-hour window fills.
-   Before that the trigger is silent and stays **OK**, not Unknown: the clause order is chosen so that
-   Zabbix stops evaluating at the first false term. That guarantee starts at the first stored value;
-   between linking and that value every trigger in every template is Unknown, and this one is not
-   special.
+1. Import `template/template_windows_resource_exhaustion_en.yaml`
+   (`Data collection → Templates → Import`, enable `Create new` and `Update existing`, leave
+   `Delete missing` off).
+2. Link it to Windows hosts together with the stock template.
+3. After a day, go through the hosts where "Handles in one process are above the ceiling" fired and decide
+   whether each holder is legitimate. If it is, override `{$WINEX.HANDLES.CEILING}` on that host.
 
-## How alerts close
+The handle ceiling is the only threshold that may need an override. Ports and pool are shares of what the
+host reports about itself: the discovered range and the physical memory. Windows has no such denominator
+for handles. The normal count depends on the process: `dns.exe` holds about 10400 on any domain
+controller, a healthy `lsass.exe` 2000-2500, the `searchd` indexer 40000-58000.
 
-The way Zabbix closes anything by default: **when the expression stops holding**. No trigger carries a
-`recovery_expression`, and that is a decision rather than an omission.
+The handle trigger reads a 24-hour minimum, so it starts firing a day after linking and stays OK until
+then.
 
-A separate recovery expression is a second, independent condition. Wherever it can be true at the same
-instant as the firing condition, Zabbix opens and closes the problem in a loop. Measured on the fleet's
-own history, at the cadence each metric is actually collected at, that cost the growth detectors 57
-problems against 19. Those detectors are gone, but the rule still binds anything added here later.
+## How problems close
 
-Ceiling triggers close when the quantity drops back below the ceiling: pool below its share of RAM, a
-process's 24-hour floor below `{$WINEX.HANDLES.CEILING}`. A process that gets restarted releases its
-alert within a day - exactly the time the new, lower value needs to push the old one out of the
-24-hour window. `manual_close` is on where closing by hand makes sense.
+Threshold triggers close when the value drops below the threshold. After a process restart the handle
+problem closes within a day, once the low value becomes the minimum of the 24-hour window. The event name
+keeps the count from the moment the problem opened; the operational data shows the current count.
 
-Both event-log triggers close themselves 30 minutes after the last log entry: they report a fact,
-not a state.
+Event-log triggers close after an hour without a new 4231 or 4227 event. An event-log item gets values only
+during an incident, so without a recovery condition the problem would never close. No other trigger has a
+recovery expression: where it can hold together with the problem expression, Zabbix opens and closes the
+problem in a loop.
 
 ## Macros
 
 | Macro | Default | Meaning |
 |---|---|---|
-| `{$WINEX.HANDLES.CEILING}` | `100000` | Handles one process may hold before it is reported regardless of trend. Read off the 24h floor rather than the last value, so a process that peaks high and falls back every day is not reported for its peaks. Measured: the largest floor on a healthy host was a search indexer at 58000 |
-| `{$WINEX.NODATA.PERIOD}` | `15m` | Silence tolerated on a probe. Keep at ≥ 3 × `{$WINEX.PROBE.INTERVAL}` |
-| `{$WINEX.POOL.NONPAGED.PCT}` | `20` | Nonpaged pool ceiling, percent of physical memory |
-| `{$WINEX.POOL.PAGED.PCT}` | `15` | Paged pool ceiling, percent of physical memory |
-| `{$WINEX.PORTS.FREE.PCT}` | `12` | Minimum acceptable headroom, as a percent of the discovered range |
-| `{$WINEX.PORTS.TIMELEFT}` | `1d` | How far ahead the exhaustion forecast looks |
-| `{$WINEX.PROBE.INTERVAL}` | `5m` | WMI polling interval |
-| `{$WINEX.SOCK.BOUND.FLOOR}` | `500` | Bound sockets a host must already hold before the port forecast may speak. The forecast only: the leak detectors carry no floor |
-| `{$WINEX.SOCK.CLOSEWAIT.MAX}` | `200` | CLOSE_WAIT sockets host-wide |
-| `{$WINEX.SOCK.TIMEWAIT.PCT}` | `25` | TIME_WAIT as a percent of the discovered port range, which is what they compete for |
-| `{$WINEX.WMI.TIMEOUT}` | `30s` | WMI item timeout. The Zabbix ceiling for an agent item; the cost of enumerating connections scales with their number, so there is nothing above this |
+| `{$WINEX.HANDLES.CEILING}` | `100000` | Handles the busiest process may hold all day, by its 24-hour minimum. The largest healthy minimum on the fleet was a search indexer at 58000 |
+| `{$WINEX.NODATA.PERIOD}` | `15m` | How long a probe may stay silent before its no-data trigger fires. At least three `{$WINEX.PROBE.INTERVAL}` |
+| `{$WINEX.POOL.NONPAGED.PCT}` | `20` | Nonpaged pool ceiling, % of physical memory |
+| `{$WINEX.POOL.PAGED.PCT}` | `15` | Paged pool ceiling, % of physical memory |
+| `{$WINEX.PORTS.FREE.PCT}` | `12` | Minimum free ports, % of the discovered range |
+| `{$WINEX.PORTS.TIMELEFT}` | `1d` | How far ahead the port forecast looks |
+| `{$WINEX.PROBE.INTERVAL}` | `5m` | Interval of the WMI probes, and the look-back of the agent liveness check in the no-data triggers |
+| `{$WINEX.SOCK.BOUND.FLOOR}` | `500` | Bound sockets a host must hold for an hour before the port forecast may fire |
+| `{$WINEX.SOCK.CLOSEWAIT.MAX}` | `200` | CLOSE_WAIT sockets on the host, held for 15 minutes |
+| `{$WINEX.SOCK.TIMEWAIT.PCT}` | `25` | TIME_WAIT sockets, % of the discovered range |
+| `{$WINEX.WMI.TIMEOUT}` | `30s` | Timeout of the WMI probes, the Zabbix maximum. Enumerating `MSFT_NetTCPConnection` takes about 4-5 ms per connection, so the socket probe stops fitting the timeout around 6000-7000 connections |
 
-Pool ceilings are a share of memory rather than a byte count, because on x64 it is memory that bounds
-the nonpaged pool. A fixed ceiling is wrong in both directions at once: tight on a large host that
-legitimately runs a large pool, and so loose on a very large one that a real runaway never reaches it.
+The pool ceilings are shares of memory because on x64 memory bounds the nonpaged pool. A byte ceiling would
+be too tight on a large host and too loose on a very large one.
 
-There is deliberately no macro for the port range itself — it is discovered. It is set with
-`netsh int ipv4 set dynamicport tcp start=N num=M`, not through the registry: `MaxUserPort` has been
-ignored since Vista. The threshold is a share rather than a count, because widening the range makes
-any fixed count mean something different.
+The port range is set with `netsh int ipv4 set dynamicport tcp start=N num=M`. Windows has ignored
+`MaxUserPort` in the registry since Vista.
 
-## Scope
+## What the template does not catch
 
-What this template deliberately does **not** catch:
-
-- **a leak before it reaches the ceiling.** This is the main and deliberate loss. A process growing
-  1000 handles a day from a base of 12000 goes unreported for 73 days, until it crosses
-  `{$WINEX.HANDLES.CEILING}`. The growth detector that caught this was here and was removed: on a live
-  fleet it reported nine hosts out of 28 at once and reopened on three. If a particular host is worth
-  watching sooner, the answer is to lower the ceiling **on that host**, not to bring the general rule
-  back;
-- **there is no forecast for handles or pool.** `timeleft` only works where history runs deeper than
-  the forecast horizon; on three days of data two ways of computing it disagree by a factor of 20. The
-  only forecast here is on ports, where the horizon is a day. Revisit once two or three weeks have
-  accumulated: Zabbix 7.0 has `trendavg`, `timeleft`, `baselinewma` and `baselinedev`, all native;
-- **a leak spread across a hundred processes** that never moves the busiest one. The reasoning is
-  that such a leak still raises the paged pool, whose ceiling is physical;
-- **`Reconnect storm` works only where the dynamic port range was discovered**, since its threshold
-  is a share of `{#PORT_NUM}`. If the `MSFT_NetTCPSetting` query never answers, a separate
-  `Port range probe: no data` trigger says so and the prototypes depend on it;
-- **a genuinely growing workload is indistinguishable from a leak** - which is exactly why the ceiling
-  is set per host rather than derived from a trend: "too much" is decided by a person who knows what
-  the server is for;
-- **GDI and USER objects are not collected.** Their per-process limit is a hard 10000, and on terminal
-  servers that is a likelier cause of failure than kernel handles. A known gap.
-
-Adjacent subjects deliberately left out:
-
-- **restart auditing** - System log (41 / 1074 / 6008 / 6009), presence and age of `MEMORY.DMP`,
-  the pending-reboot flag;
-- **RDS sessions** - `\Terminal Services\*` counters.
+- **A leak below the ceiling.** A process adding 1000 handles a day from 12000 is reported after 73 days,
+  when it crosses `{$WINEX.HANDLES.CEILING}`. To watch a host earlier, lower the ceiling on that host.
+- **A forecast for handles and pool.** `timeleft` needs history deeper than its horizon. Only ports have a
+  forecast, with a one-day horizon.
+- **A leak spread over a hundred processes** that does not move the busiest one. Such a leak raises the
+  paged pool, and its ceiling fires.
+- **Growing load versus a leak.** That is why the ceiling is set per host by someone who knows the server's
+  role.
+- **GDI and USER objects.** They are limited to 10000 per process and on terminal servers run out sooner
+  than kernel handles.
+- **RDS sessions** - the `\Terminal Services\*` counters.
 
 ## License
 
