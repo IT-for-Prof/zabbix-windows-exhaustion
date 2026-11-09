@@ -55,7 +55,7 @@ zabbix_export:
         License: MIT (c) 2026 Konstantin Tyutyunnik
       vendor:
         name: itforprof.com
-        version: 1.6.0
+        version: 1.6.1
       groups:
         - name: Templates/Operating systems
       items:
@@ -643,7 +643,7 @@ zabbix_export:
       macros:
         - macro: '{$WINEX.HANDLES.CEILING}'
           value: '100000'
-          description: 'Handles the busiest process may hold all day, measured as its 24-hour minimum. On the fleet the largest healthy minimum was a search indexer at 58000. Override it on a host with a legitimately large holder.'
+          description: 'Ceiling on the 24-hour minimum of handles in the busiest process, over the samples present in the window. On the fleet the largest healthy minimum was a search indexer at 58000. Override it on a host with a legitimately large holder.'
         - macro: '{$WINEX.NODATA.PERIOD}'
           value: 15m
           description: 'How long a probe may stay silent before its no-data trigger fires. At least three times {$WINEX.PROBE.INTERVAL}.'
@@ -826,8 +826,9 @@ zabbix_export:
       url_name: 'Handle items on this host'
       url: 'zabbix.php?action=latest.view&hostids%5B%5D={HOST.ID}&name=Handles&filter_set=1'
       description: |
-        The busiest process held more than {$WINEX.HANDLES.CEILING} handles all day: the trigger reads the
-        24-hour minimum, so daily peaks are not reported.
+        Every sample in the last 24 hours shows the busiest process above {$WINEX.HANDLES.CEILING} handles: the
+        trigger reads the 24-hour minimum, so daily peaks are not reported. The window may be incomplete: after
+        linking or a data gap the trigger can fire on a single sample.
         The ceiling is not a Windows limit; the per-process limit is 16777216. The largest holder differs from
         host to host (svchost, lsass, a search indexer), so where a host legitimately runs a large one, override
         {$WINEX.HANDLES.CEILING} on that host.

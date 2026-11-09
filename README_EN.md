@@ -116,8 +116,8 @@ host reports about itself: the discovered range and the physical memory. Windows
 for handles. The normal count depends on the process: `dns.exe` holds about 10400 on any domain
 controller, a healthy `lsass.exe` 2000-2500, the `searchd` indexer 40000-58000.
 
-The handle trigger reads a 24-hour minimum, so it starts firing a day after linking and stays OK until
-then.
+The handle trigger reads the minimum of the samples in the last 24 hours and does not wait for the window
+to fill: right after linking or a data gap it can fire on a single sample above the ceiling.
 
 ## How problems close
 
@@ -134,7 +134,7 @@ problem in a loop.
 
 | Macro | Default | Meaning |
 |---|---|---|
-| `{$WINEX.HANDLES.CEILING}` | `100000` | Handles the busiest process may hold all day, by its 24-hour minimum. The largest healthy minimum on the fleet was a search indexer at 58000 |
+| `{$WINEX.HANDLES.CEILING}` | `100000` | Ceiling on the 24-hour minimum of handles in the busiest process, over the samples present in the window. The largest healthy minimum on the fleet was a search indexer at 58000 |
 | `{$WINEX.NODATA.PERIOD}` | `15m` | How long a probe may stay silent before its no-data trigger fires. At least three `{$WINEX.PROBE.INTERVAL}` |
 | `{$WINEX.POOL.NONPAGED.PCT}` | `20` | Nonpaged pool ceiling, % of physical memory |
 | `{$WINEX.POOL.PAGED.PCT}` | `15` | Paged pool ceiling, % of physical memory |
